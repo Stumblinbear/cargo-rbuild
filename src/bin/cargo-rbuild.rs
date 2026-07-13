@@ -12,9 +12,6 @@
 //!   RBUILD_HOST   default "truenas.lan"
 //!   RBUILD_KEY    default ~/.ssh/id_ed25519
 
-use ignore::WalkBuilder;
-use rbuild::*;
-use ssh_key::{HashAlg, LineEnding, PrivateKey};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -22,6 +19,10 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant, UNIX_EPOCH};
+
+use cargo_rbuild::*;
+use ignore::WalkBuilder;
+use ssh_key::{HashAlg, LineEnding, PrivateKey};
 
 const TARGET: &str = "x86_64-pc-windows-msvc";
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(1200);
@@ -64,7 +65,9 @@ fn main() -> ExitCode {
         return die("cannot derive project name from cwd");
     };
     if !valid_project(&proj) {
-        return die(&format!("project name {proj:?} has characters I won't send"));
+        return die(&format!(
+            "project name {proj:?} has characters I won't send"
+        ));
     }
     let profile = if cargo_args.iter().any(|a| a == "--release") {
         "release"
@@ -74,7 +77,18 @@ fn main() -> ExitCode {
     let out_dir = cwd.join("target").join("remote").join(profile);
     let exe_name = format!("{proj}.exe");
 
-    match remote(&cwd, &proj, &sub, &cargo_args, &TARGET.to_string(), profile, &out_dir, &exe_name, produces, full) {
+    match remote(
+        &cwd,
+        &proj,
+        &sub,
+        &cargo_args,
+        &TARGET.to_string(),
+        profile,
+        &out_dir,
+        &exe_name,
+        produces,
+        full,
+    ) {
         Ok(Some(code)) => {
             if code != 0 {
                 return ExitCode::from(code.min(255) as u8);
@@ -83,7 +97,16 @@ fn main() -> ExitCode {
         Ok(None) => {} // handled: fall through to run
         Err(e) => {
             eprintln!("[rbuild] {e} — building locally");
-            return local(&sub, &cargo_args, produces, run, profile, &proj, &out_dir, &exe_args);
+            return local(
+                &sub,
+                &cargo_args,
+                produces,
+                run,
+                profile,
+                &proj,
+                &out_dir,
+                &exe_args,
+            );
         }
     }
 
@@ -147,7 +170,12 @@ fn remote(
     let remote_files: HashMap<String, FileHeader> = if full {
         HashMap::new()
     } else {
-        send(&mut w, &ClientMsg::Manifest { project: proj.into() })?;
+        send(
+            &mut w,
+            &ClientMsg::Manifest {
+                project: proj.into(),
+            },
+        )?;
         match recv::<ServerMsg, _>(&mut r)? {
             ServerMsg::Manifest(v) => v.into_iter().map(|h| (h.path.clone(), h)).collect(),
             ServerMsg::Error(e) => return Err(io::Error::other(e)),
@@ -266,7 +294,10 @@ fn remote(
         }
         // rename last, so a half-written exe never masquerades as a good one
         fs::rename(&tmp, out_dir.join(exe_name))?;
-        eprintln!("[rbuild] {} -> target\\remote\\{profile}\\{exe_name}", human(n));
+        eprintln!(
+            "[rbuild] {} -> target\\remote\\{profile}\\{exe_name}",
+            human(n)
+        );
     }
 
     let _ = send(&mut w, &ClientMsg::Bye);
@@ -343,7 +374,9 @@ fn scan_local(root: &Path) -> io::Result<HashMap<String, FileHeader>> {
         if rel.is_empty() || !valid_rel(&rel) {
             continue;
         }
-        let Ok(modified) = md.modified() else { continue };
+        let Ok(modified) = md.modified() else {
+            continue;
+        };
         let mtime = modified
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -374,9 +407,8 @@ fn key_path() -> PathBuf {
 
 fn load_key() -> io::Result<PrivateKey> {
     let path = key_path();
-    let mut key = PrivateKey::read_openssh_file(&path).map_err(|e| {
-        io::Error::other(format!("reading {}: {e}", path.display()))
-    })?;
+    let mut key = PrivateKey::read_openssh_file(&path)
+        .map_err(|e| io::Error::other(format!("reading {}: {e}", path.display())))?;
     if key.is_encrypted() {
         let pw = rpassword::prompt_password(format!("passphrase for {}: ", path.display()))?;
         key = key.decrypt(pw).map_err(io::Error::other)?;
@@ -415,7 +447,10 @@ fn verify_host(host: &str, pubkey: &str) -> io::Result<()> {
     }
 
     eprintln!("[rbuild] pinning new host key for {host}: {fp}");
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(&file)?;
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&file)?;
     writeln!(f, "{host} {fp}")?;
     Ok(())
 }

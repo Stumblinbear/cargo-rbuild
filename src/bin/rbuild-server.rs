@@ -7,9 +7,6 @@
 //!   RBUILD_TARGETS          default /targets
 //!   RBUILD_BIND             default 0.0.0.0:7878
 
-use rand_core::{OsRng, RngCore};
-use rbuild::*;
-use ssh_key::{Algorithm, HashAlg, LineEnding, PrivateKey, PublicKey, SshSig};
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -17,6 +14,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
+
+use cargo_rbuild::*;
+use rand_core::{OsRng, RngCore};
+use ssh_key::{Algorithm, HashAlg, LineEnding, PrivateKey, PublicKey, SshSig};
 
 fn env_or(k: &str, d: &str) -> String {
     std::env::var(k).unwrap_or_else(|_| d.into())
@@ -215,7 +216,10 @@ fn serve(stream: TcpStream, authorized: &[PublicKey], host_key: &PrivateKey) -> 
                 }
                 let path = tgt_root.join(&project).join(&rel);
                 match fs::File::open(&path) {
-                    Err(e) => send(&mut w, &ServerMsg::Error(format!("{}: {e}", path.display())))?,
+                    Err(e) => send(
+                        &mut w,
+                        &ServerMsg::Error(format!("{}: {e}", path.display())),
+                    )?,
                     Ok(f) => {
                         let mut f = BufReader::with_capacity(CHUNK, f);
                         let mut buf = vec![0u8; CHUNK];
@@ -246,7 +250,10 @@ fn run_cargo<W: Write>(
     target: &str,
 ) -> io::Result<i32> {
     if !cwd.is_dir() {
-        send(w, &ServerMsg::Error(format!("{} not synced", cwd.display())))?;
+        send(
+            w,
+            &ServerMsg::Error(format!("{} not synced", cwd.display())),
+        )?;
         return Ok(1);
     }
 
@@ -304,14 +311,18 @@ fn spawn_pump<R: Read + Send + 'static>(
 }
 
 fn walk(root: &Path, dir: &Path, out: &mut Vec<FileHeader>) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     for e in entries.flatten() {
         let p = e.path();
         let Ok(md) = e.metadata() else { continue };
         if md.is_dir() {
             walk(root, &p, out);
         } else if md.is_file() {
-            let Ok(rel) = p.strip_prefix(root) else { continue };
+            let Ok(rel) = p.strip_prefix(root) else {
+                continue;
+            };
             let rel = rel
                 .components()
                 .filter_map(|c| c.as_os_str().to_str())

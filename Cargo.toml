@@ -1,5 +1,5 @@
 [package]
-name = "rbuild"
+name = "cargo-rbuild"
 version = "0.1.0"
 edition = "2021"
 
@@ -21,8 +21,8 @@ ignore = "0.4"
 rpassword = "7"
 
 [[bin]]
-name = "rbuild"
-path = "src/bin/rbuild.rs"
+name = "cargo-rbuild"
+path = "src/bin/cargo-rbuild.rs"
 
 [[bin]]
 name = "rbuild-server"
