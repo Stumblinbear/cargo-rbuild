@@ -26,9 +26,16 @@ use ssh_key::{HashAlg, LineEnding, PrivateKey};
 
 const TARGET: &str = "x86_64-pc-windows-msvc";
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(1200);
+const PASSTHROUGH: [&str; 5] = ["build", "check", "clippy", "test", "doc"];
 
 fn main() -> ExitCode {
-    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let mut raw: Vec<String> = std::env::args().skip(1).collect();
+
+    // Cargo re-passes the subcommand name as argv[1]; a direct call doesn't.
+    if raw.first().map(String::as_str) == Some("rbuild") {
+        raw.remove(0);
+    }
+
     let full = raw.iter().any(|a| a == "--full");
     let mut rest: Vec<String> = raw.into_iter().filter(|a| a != "--full").collect();
 
@@ -44,6 +51,10 @@ fn main() -> ExitCode {
     if sub == "run" {
         sub = "build".into();
         run = true;
+    }
+
+    if !PASSTHROUGH.contains(&sub.as_str()) {
+        return die(&format!("unknown subcommand {sub:?}"));
     }
 
     let exe_args: Vec<String> = match rest.iter().position(|a| a == "--") {
@@ -94,9 +105,16 @@ fn main() -> ExitCode {
                 return ExitCode::from(code.min(255) as u8);
             }
         }
-        Ok(None) => {} // handled: fall through to run
+
+        Ok(None) => {}
+
         Err(e) => {
-            eprintln!("[rbuild] {e} — building locally");
+            if e.raw_os_error() == Some(11001) {
+                eprintln!("[rbuild] can't resolve host — check RBUILD_HOST. Building locally.");
+            } else {
+                eprintln!("[rbuild] {e} — building locally");
+            }
+
             return local(
                 &sub,
                 &cargo_args,
