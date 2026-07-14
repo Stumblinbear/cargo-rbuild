@@ -1,0 +1,23 @@
+# Standalone on purpose: without an empty [workspace], cargo walks up, finds the
+# rbuild manifest, and refuses to build either crate.
+[workspace]
+
+[package]
+name = "probe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+# Two bins and no `default-run`, so `rbuild run` with no --bin has to refuse.
+[[bin]]
+name = "alpha"
+path = "src/bin/alpha.rs"
+
+[[bin]]
+name = "beta"
+path = "src/bin/beta.rs"
+
+[[bench]]
+name = "probebench"
+harness = false

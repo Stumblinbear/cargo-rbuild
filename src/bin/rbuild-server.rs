@@ -195,26 +195,40 @@ fn serve(stream: TcpStream, authorized: &[PublicKey], host_key: &PrivateKey) -> 
                 target,
                 trailing,
             } => {
-                if !valid_project(&project) {
-                    send(&mut w, &ServerMsg::Error("bad project name".into()))?;
-                    continue;
-                }
-
-                let tdir = match target {
-                    Some(_) => tgt_root.join(&project),
-                    None => tgt_root.join(format!("{project}-native")),
-                };
-
-                let code = run_cargo(
+                let code = cargo_for(
                     &mut w,
-                    &src_root.join(&project),
-                    &tdir,
+                    &src_root,
+                    &tgt_root,
+                    &project,
                     &subcommand,
                     &args,
                     target.as_deref(),
                     &trailing,
+                    Streams::Merged,
                 )?;
+                let Some(code) = code else { continue };
+                send(&mut w, &ServerMsg::Exit(code))?;
+            }
 
+            ClientMsg::Cargo {
+                project,
+                subcommand,
+                args,
+                target,
+                trailing,
+            } => {
+                let code = cargo_for(
+                    &mut w,
+                    &src_root,
+                    &tgt_root,
+                    &project,
+                    &subcommand,
+                    &args,
+                    target.as_deref(),
+                    &trailing,
+                    Streams::Tagged,
+                )?;
+                let Some(code) = code else { continue };
                 send(&mut w, &ServerMsg::Exit(code))?;
             }
 
@@ -272,9 +286,59 @@ impl<W: Write> Write for FrameSink<'_, W> {
     }
 }
 
+/// Locates a project's trees and runs cargo in them. `Ok(None)` means the
+/// request was rejected and the error already went out.
+///
+/// A cross build and a native one never share a target dir: the same profile
+/// path would hold a PE in one and an ELF in the other.
+#[allow(clippy::too_many_arguments)]
+fn cargo_for<W: Write>(
+    w: &mut W,
+    src_root: &Path,
+    tgt_root: &Path,
+    project: &str,
+    subcommand: &str,
+    args: &[String],
+    target: Option<&str>,
+    trailing: &[String],
+    streams: Streams,
+) -> io::Result<Option<i32>> {
+    if !valid_project(project) {
+        send(w, &ServerMsg::Error("bad project name".into()))?;
+        return Ok(None);
+    }
+    let tdir = match target {
+        Some(_) => tgt_root.join(project),
+        None => tgt_root.join(format!("{project}-native")),
+    };
+    run_cargo(
+        w,
+        &src_root.join(project),
+        &tdir,
+        subcommand,
+        args,
+        target,
+        trailing,
+        streams,
+    )
+    .map(Some)
+}
+
+/// How cargo's two output streams reach the client.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Streams {
+    /// One interleaved stream of `Output`, which is all a build needs and all an
+    /// older client can decode.
+    Merged,
+    /// `Chunk`s that say which stream they came from. An executed program's
+    /// stdout is its result, so it must not be folded into diagnostics.
+    Tagged,
+}
+
 /// Spawn cargo directly — no shell, so nothing in `args` can be interpreted.
 /// stdout and stderr are pumped by two threads into one channel and forwarded
 /// as they arrive, which is what makes the client's output feel live.
+#[allow(clippy::too_many_arguments)]
 fn run_cargo<W: Write>(
     w: &mut W,
     cwd: &Path,
@@ -283,6 +347,7 @@ fn run_cargo<W: Write>(
     args: &[String],
     target: Option<&str>,
     trailing: &[String],
+    streams: Streams,
 ) -> io::Result<i32> {
     if !cwd.is_dir() {
         send(
@@ -294,9 +359,14 @@ fn run_cargo<W: Write>(
 
     let mut cmd = Command::new("cargo");
     match target {
-        // cross: xwin supplies the MSVC sysroot and lld-link
-        Some(t) => {
+        // xwin supplies the MSVC sysroot and lld-link, which a Windows host
+        // already has. Running the server on Windows is how the test rig
+        // exercises the cross path without a cargo-xwin install.
+        Some(t) if !cfg!(windows) => {
             cmd.arg("xwin").arg(subcommand).arg("--target").arg(t);
+        }
+        Some(t) => {
+            cmd.arg(subcommand).arg("--target").arg(t);
         }
 
         // native: plain cargo, runs here
@@ -320,18 +390,21 @@ fn run_cargo<W: Write>(
         .stderr(Stdio::piped())
         .spawn()?;
 
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let (tx, rx) = mpsc::channel::<(bool, Vec<u8>)>();
     let mut pumps = Vec::new();
     if let Some(out) = child.stdout.take() {
-        pumps.push(spawn_pump(out, tx.clone()));
+        pumps.push(spawn_pump(out, false, tx.clone()));
     }
     if let Some(err) = child.stderr.take() {
-        pumps.push(spawn_pump(err, tx.clone()));
+        pumps.push(spawn_pump(err, true, tx.clone()));
     }
     drop(tx); // last sender goes with the pumps; rx ends when both close
 
-    for chunk in rx {
-        send(w, &ServerMsg::Output(chunk))?;
+    for (err, data) in rx {
+        match streams {
+            Streams::Merged => send(w, &ServerMsg::Output(data))?,
+            Streams::Tagged => send(w, &ServerMsg::Chunk { err, data })?,
+        }
     }
     for p in pumps {
         let _ = p.join();
@@ -342,7 +415,8 @@ fn run_cargo<W: Write>(
 
 fn spawn_pump<R: Read + Send + 'static>(
     mut r: R,
-    tx: mpsc::Sender<Vec<u8>>,
+    err: bool,
+    tx: mpsc::Sender<(bool, Vec<u8>)>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut buf = vec![0u8; 8192];
@@ -350,7 +424,7 @@ fn spawn_pump<R: Read + Send + 'static>(
             match r.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if tx.send(buf[..n].to_vec()).is_err() {
+                    if tx.send((err, buf[..n].to_vec())).is_err() {
                         break;
                     }
                 }

@@ -54,6 +54,23 @@ pub enum ClientMsg {
         rel: String,
     },
     Bye,
+    // Appended, not inserted: bincode numbers variants by position, so an older
+    // peer still decodes every message it already knew.
+    /// Run cargo and reply with `Chunk`s, then `Exit`.
+    ///
+    /// Unlike [`ClientMsg::Build`], the two output streams stay apart, so the
+    /// caller can read `--message-format=json` records off stdout while
+    /// diagnostics still reach a terminal. A `None` target builds for the
+    /// server's own platform, which is the only way `run`, `test` and `bench`
+    /// can execute anything there.
+    Cargo {
+        project: String,
+        subcommand: String,
+        args: Vec<String>,
+        target: Option<String>,
+        /// Args after `--`: the program's own argv, or its harness's.
+        trailing: Vec<String>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -75,6 +92,12 @@ pub enum ServerMsg {
         raw: u64,
     },
     Error(String),
+    /// A chunk of an executing program's output, tagged with the stream it came
+    /// from so the client can reproduce the split on its own stdout and stderr.
+    Chunk {
+        err: bool,
+        data: Vec<u8>,
+    },
 }
 
 pub fn send<T: Serialize, W: Write>(w: &mut W, msg: &T) -> io::Result<()> {
