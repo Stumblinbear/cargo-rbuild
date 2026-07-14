@@ -14,6 +14,7 @@ ssh-key = { version = "0.6", features = [
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
+zstd = "0.13"
 
 [target.'cfg(windows)'.dependencies]
 # .gitignore semantics for the source walk — client only

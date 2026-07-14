@@ -71,9 +71,13 @@ pub enum ServerMsg {
     Output(Vec<u8>),
     Exit(i32),
     Data(Vec<u8>),
-    DataEnd,
+    DataEnd {
+        raw: u64,
+    },
     Error(String),
 }
+
+pub const ZSTD_LEVEL: i32 = 3;
 
 pub fn send<T: Serialize, W: Write>(w: &mut W, msg: &T) -> io::Result<()> {
     let body = bincode::serialize(msg).map_err(io::Error::other)?;

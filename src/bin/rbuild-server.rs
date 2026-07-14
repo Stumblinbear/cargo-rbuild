@@ -230,20 +230,35 @@ fn serve(stream: TcpStream, authorized: &[PublicKey], host_key: &PrivateKey) -> 
                         &ServerMsg::Error(format!("{}: {e}", path.display())),
                     )?,
                     Ok(f) => {
+                        let raw = f.metadata().map(|m| m.len()).unwrap_or(0);
                         let mut f = BufReader::with_capacity(CHUNK, f);
-                        let mut buf = vec![0u8; CHUNK];
-                        loop {
-                            let n = f.read(&mut buf)?;
-                            if n == 0 {
-                                break;
-                            }
-                            send(&mut w, &ServerMsg::Data(buf[..n].to_vec()))?;
-                        }
-                        send(&mut w, &ServerMsg::DataEnd)?;
+
+                        // zstd's encoder emits ~128 KB blocks; each becomes one Data frame.
+                        let mut enc =
+                            zstd::stream::write::Encoder::new(FrameSink { w: &mut w }, ZSTD_LEVEL)?;
+                        io::copy(&mut f, &mut enc)?;
+                        enc.finish()?; // flushes the trailing block; returns the sink, which we drop
+
+                        send(&mut w, &ServerMsg::DataEnd { raw })?;
                     }
                 }
             }
         }
+    }
+}
+
+/// Turns writes from the zstd encoder into protocol frames.
+struct FrameSink<'a, W: Write> {
+    w: &'a mut W,
+}
+
+impl<W: Write> Write for FrameSink<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        send(self.w, &ServerMsg::Data(buf.to_vec()))?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(()) // `send` already flushes the underlying BufWriter
     }
 }
 

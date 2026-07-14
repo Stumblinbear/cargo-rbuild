@@ -300,33 +300,46 @@ fn remote(
                 rel,
             },
         )?;
+
         fs::create_dir_all(out_dir)?;
         let tmp = out_dir.join(format!("{exe_name}.part"));
-        let mut n = 0u64;
-        {
-            let mut f = BufWriter::new(fs::File::create(&tmp)?);
-            loop {
+
+        let mut wire = 0u64;
+        let raw = {
+            let file = BufWriter::with_capacity(CHUNK, fs::File::create(&tmp)?);
+            let mut dec = zstd::stream::write::Decoder::new(file)?;
+            let raw = loop {
                 match recv::<ServerMsg, _>(&mut r)? {
                     ServerMsg::Data(d) => {
-                        f.write_all(&d)?;
-                        n += d.len() as u64;
+                        wire += d.len() as u64;
+                        dec.write_all(&d)?;
                     }
-                    ServerMsg::DataEnd => break,
+                    ServerMsg::DataEnd { raw } => break raw,
                     ServerMsg::Error(e) => {
                         let _ = fs::remove_file(&tmp);
                         return Err(io::Error::other(format!("fetch: {e}")));
                     }
                     _ => return Err(io::Error::other("unexpected message during fetch")),
                 }
-            }
-            f.flush()?;
-        }
-        // rename last, so a half-written exe never masquerades as a good one
+            };
+            dec.flush()?;
+            dec.into_inner().flush()?;
+            raw
+        };
+
+        // rename last: a half-written exe must never look like a good one
         fs::rename(&tmp, out_dir.join(exe_name))?;
+
+        let ratio = if wire > 0 {
+            raw as f64 / wire as f64
+        } else {
+            1.0
+        };
         eprintln!(
-            "[rbuild] {} -> target\\remote\\{profile}\\{exe_name}",
-            human(n)
-        );
+        "[rbuild] {} on the wire, {} on disk ({ratio:.1}x) -> target\\remote\\{profile}\\{exe_name}",
+        human(wire),
+        human(raw)
+    );
     }
 
     let _ = send(&mut w, &ClientMsg::Bye);
