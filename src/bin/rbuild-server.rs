@@ -193,19 +193,28 @@ fn serve(stream: TcpStream, authorized: &[PublicKey], host_key: &PrivateKey) -> 
                 subcommand,
                 args,
                 target,
+                trailing,
             } => {
                 if !valid_project(&project) {
                     send(&mut w, &ServerMsg::Error("bad project name".into()))?;
                     continue;
                 }
+
+                let tdir = match target {
+                    Some(_) => tgt_root.join(&project),
+                    None => tgt_root.join(format!("{project}-native")),
+                };
+
                 let code = run_cargo(
                     &mut w,
                     &src_root.join(&project),
-                    &tgt_root.join(&project),
+                    &tdir,
                     &subcommand,
                     &args,
-                    &target,
+                    target.as_deref(),
+                    &trailing,
                 )?;
+
                 send(&mut w, &ServerMsg::Exit(code))?;
             }
 
@@ -247,7 +256,8 @@ fn run_cargo<W: Write>(
     target_dir: &Path,
     subcommand: &str,
     args: &[String],
-    target: &str,
+    target: Option<&str>,
+    trailing: &[String],
 ) -> io::Result<i32> {
     if !cwd.is_dir() {
         send(
@@ -257,12 +267,26 @@ fn run_cargo<W: Write>(
         return Ok(1);
     }
 
-    let mut child = Command::new("cargo")
-        .arg("xwin")
-        .arg(subcommand)
-        .arg("--target")
-        .arg(target)
-        .args(args)
+    let mut cmd = Command::new("cargo");
+    match target {
+        // cross: xwin supplies the MSVC sysroot and lld-link
+        Some(t) => {
+            cmd.arg("xwin").arg(subcommand).arg("--target").arg(t);
+        }
+
+        // native: plain cargo, runs here
+        None => {
+            cmd.arg(subcommand);
+        }
+    }
+
+    cmd.args(args);
+
+    if !trailing.is_empty() {
+        cmd.arg("--").args(trailing);
+    }
+
+    let mut child = cmd
         .current_dir(cwd)
         .env("CARGO_TARGET_DIR", target_dir)
         .env("CARGO_TERM_COLOR", "always")

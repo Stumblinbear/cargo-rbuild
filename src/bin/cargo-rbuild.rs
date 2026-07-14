@@ -26,7 +26,7 @@ use ssh_key::{HashAlg, LineEnding, PrivateKey};
 
 const TARGET: &str = "x86_64-pc-windows-msvc";
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(1200);
-const PASSTHROUGH: [&str; 5] = ["build", "check", "clippy", "test", "doc"];
+const PASSTHROUGH: [&str; 7] = ["build", "check", "clippy", "test", "bench", "run", "doc"];
 
 fn main() -> ExitCode {
     let mut raw: Vec<String> = std::env::args().skip(1).collect();
@@ -37,18 +37,25 @@ fn main() -> ExitCode {
     }
 
     let full = raw.iter().any(|a| a == "--full");
-    let mut rest: Vec<String> = raw.into_iter().filter(|a| a != "--full").collect();
+    let native = raw.iter().any(|a| a == "--native");
+    let mut rest: Vec<String> = raw
+        .into_iter()
+        .filter(|a| a != "--full" && a != "--native")
+        .collect();
 
     let mut sub = if rest.is_empty() {
-        "build".to_string()
+        "build".into()
     } else {
         rest.remove(0)
     };
 
-    // `cargo run` on a Linux host cross-compiling to Windows would try to exec
-    // a PE binary. Downgrade to `build`; we execute it here instead.
+    // bench and test only make sense executed, and we can't execute a PE binary
+    // on the server — so they're always native.
+    let native = native || matches!(sub.as_str(), "bench" | "test");
+
     let mut run = false;
-    if sub == "run" {
+    if !native && sub == "run" {
+        // cross-compiled: build there, execute here
         sub = "build".into();
         run = true;
     }
@@ -63,7 +70,7 @@ fn main() -> ExitCode {
     };
     let cargo_args = rest;
 
-    let produces = sub == "build";
+    let produces = !native && sub == "build";
     if !produces {
         run = false;
     }
@@ -93,7 +100,8 @@ fn main() -> ExitCode {
         &proj,
         &sub,
         &cargo_args,
-        &TARGET.to_string(),
+        if native { None } else { Some(TARGET) },
+        &exe_args,
         profile,
         &out_dir,
         &exe_name,
@@ -140,7 +148,8 @@ fn remote(
     proj: &str,
     sub: &str,
     cargo_args: &[String],
-    target: &str,
+    target: Option<&str>,
+    trailing: &[String],
     profile: &str,
     out_dir: &Path,
     exe_name: &str,
@@ -256,7 +265,8 @@ fn remote(
             project: proj.into(),
             subcommand: sub.into(),
             args: cargo_args.to_vec(),
-            target: target.into(),
+            target: target.map(String::from),
+            trailing: trailing.to_vec(),
         },
     )?;
 
@@ -281,7 +291,8 @@ fn remote(
 
     // ---- fetch ----------------------------------------------------------
     if produces {
-        let rel = format!("{target}/{profile}/{exe_name}");
+        let t = target.expect("produces implies a cross target");
+        let rel = format!("{t}/{profile}/{exe_name}");
         send(
             &mut w,
             &ClientMsg::Fetch {

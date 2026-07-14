@@ -43,7 +43,10 @@ pub enum ClientMsg {
         project: String,
         subcommand: String,
         args: Vec<String>,
-        target: String,
+        /// `None` => native host build, run in the container.
+        target: Option<String>,
+        /// Args after `--` (criterion filters, example argv).
+        trailing: Vec<String>,
     },
     /// Fetch an artifact. Server restricts this to the targets tree.
     Fetch {
