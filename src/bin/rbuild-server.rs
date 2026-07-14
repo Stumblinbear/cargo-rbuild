@@ -234,8 +234,10 @@ fn serve(stream: TcpStream, authorized: &[PublicKey], host_key: &PrivateKey) -> 
                         let mut f = BufReader::with_capacity(CHUNK, f);
 
                         // zstd's encoder emits ~128 KB blocks; each becomes one Data frame.
-                        let mut enc =
-                            zstd::stream::write::Encoder::new(FrameSink { w: &mut w }, ZSTD_LEVEL)?;
+                        let mut enc = zstd::stream::write::Encoder::new(
+                            FrameSink { w: &mut w },
+                            zstd_level(),
+                        )?;
                         io::copy(&mut f, &mut enc)?;
                         enc.finish()?; // flushes the trailing block; returns the sink, which we drop
 
@@ -245,6 +247,14 @@ fn serve(stream: TcpStream, authorized: &[PublicKey], host_key: &PrivateKey) -> 
             }
         }
     }
+}
+
+pub fn zstd_level() -> i32 {
+    std::env::var("RBUILD_ZSTD_LEVEL")
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .map(|n| n.clamp(-5, 22)) // negative levels are real: fast, low ratio
+        .unwrap_or(3)
 }
 
 /// Turns writes from the zstd encoder into protocol frames.

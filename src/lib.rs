@@ -77,8 +77,6 @@ pub enum ServerMsg {
     Error(String),
 }
 
-pub const ZSTD_LEVEL: i32 = 3;
-
 pub fn send<T: Serialize, W: Write>(w: &mut W, msg: &T) -> io::Result<()> {
     let body = bincode::serialize(msg).map_err(io::Error::other)?;
     if body.len() as u64 > MAX_FRAME as u64 {
