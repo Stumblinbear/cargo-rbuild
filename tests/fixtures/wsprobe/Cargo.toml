@@ -1,0 +1,10 @@
+# A real two-crate workspace, root and members alike. `probe` next door covers
+# the single-package path; this one is what exercises workspace sync and
+# package selection: a virtual root with inherited edition, one lib+test
+# member, one bin member.
+[workspace]
+members = ["crates/wscore", "crates/wsbin"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"

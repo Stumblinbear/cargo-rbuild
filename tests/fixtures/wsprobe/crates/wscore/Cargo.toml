@@ -1,0 +1,8 @@
+[package]
+name = "wscore"
+version = "0.1.0"
+edition.workspace = true
+
+[lib]
+name = "wscore"
+path = "src/lib.rs"

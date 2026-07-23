@@ -39,11 +39,11 @@ fn real_home() -> PathBuf {
     PathBuf::from(home)
 }
 
-fn fixture() -> PathBuf {
+fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
-        .join("probe")
+        .join(name)
 }
 
 /// A line of a client's output and how long after launch it arrived.
@@ -150,15 +150,25 @@ impl Rig {
     }
 
     /// The project tree as the server sees it, which is what the probe's baked
-    /// `CARGO_MANIFEST_DIR` must point at.
-    fn remote_project(&self) -> PathBuf {
-        self.dir.join("src").join("probe")
+    /// `CARGO_MANIFEST_DIR` must point at. `project` is the sync root's own
+    /// dirname — the workspace root's for a workspace, the crate's own for a
+    /// standalone package.
+    fn remote_project(&self, project: &str) -> PathBuf {
+        self.dir.join("src").join(project)
     }
 
+    /// Runs the client from the `probe` fixture, as every single-package test
+    /// does.
     fn client(&self, args: &[&str]) -> Run {
+        self.client_in(&fixture("probe"), args)
+    }
+
+    /// Runs the client from an arbitrary directory — a workspace root or one
+    /// of its members.
+    fn client_in(&self, dir: &Path, args: &[&str]) -> Run {
         let mut cmd = Command::new(CLIENT);
         cmd.args(args)
-            .current_dir(fixture())
+            .current_dir(dir)
             .env("RBUILD_HOST", "127.0.0.1")
             .env("RBUILD_PORT", self.port.to_string())
             .env("RBUILD_KEY", self.dir.join("key"))
@@ -192,9 +202,14 @@ impl Drop for Rig {
 /// it makes before connecting shell out to `cargo metadata`, and rustup finds
 /// its toolchain through the home dir.
 fn offline(args: &[&str]) -> Run {
+    offline_in(&fixture("probe"), args)
+}
+
+/// Same as [`offline`], from an arbitrary directory.
+fn offline_in(dir: &Path, args: &[&str]) -> Run {
     let mut cmd = Command::new(CLIENT);
     cmd.args(args)
-        .current_dir(fixture())
+        .current_dir(dir)
         .env("RBUILD_HOST", "127.0.0.1")
         .env("RBUILD_PORT", "1"); // refused instantly if anything does try to connect
     run(cmd)
@@ -262,7 +277,7 @@ fn remote_run_streams_argv_and_exit_code() {
 
     // Proof the binary really was built on the server: the manifest dir it baked
     // in at compile time is the server's copy of the tree, not this one.
-    let remote = rig.remote_project();
+    let remote = rig.remote_project("probe");
     assert!(
         out.contains(&format!("MANIFEST_DIR={}", remote.display())),
         "expected a manifest dir under {}:\n{out}",
@@ -329,7 +344,7 @@ fn bench_fetches_the_hashed_binary_and_runs_it_here() {
 
     // Ran here, off a fetched file, not on the server.
     let err = r.stderr();
-    let fetched = fixture().join("target").join("remote");
+    let fetched = fixture("probe").join("target").join("remote");
     assert!(
         err.contains(&format!("running {}", fetched.display())),
         "the bench did not run from the fetched binary:\n{err}"
@@ -391,4 +406,255 @@ fn ambiguity_is_refused() {
     let r = offline(&["run", "--example", "nosuch"]);
     assert_eq!(r.code, 1);
     assert!(r.stderr().contains("no example target"), "{}", r.stderr());
+}
+
+// ---- workspaces -----------------------------------------------------------
+//
+// `wsprobe` is a real two-crate workspace: a virtual root with an inherited
+// edition, `wscore` (lib + integration test `it`), `wsbin` (bin + integration
+// test `smoke`). It exercises what `probe` can't: syncing the workspace root
+// rather than whatever directory the command was typed from, and resolving
+// which package(s) a command line actually selects.
+
+fn ws_root() -> PathBuf {
+    fixture("wsprobe")
+}
+
+fn ws_member(name: &str) -> PathBuf {
+    ws_root().join("crates").join(name)
+}
+
+/// Failure mode A: a bare `cargo rbuild test` from the workspace root used to
+/// die with "cwd is a workspace root, not a package" before it ever reached a
+/// server — `plan`/`select` run locally, so `offline` alone proves it either
+/// way.
+#[test]
+fn workspace_root_bare_subcommand_is_no_longer_refused() {
+    let r = offline_in(&ws_root(), &["test"]);
+
+    assert!(
+        !r.stderr().contains("workspace root, not a package"),
+        "the deleted error came back:\n{}",
+        r.stderr()
+    );
+    // No server on the other end of an offline run, so reaching this point
+    // fell back to a real local `cargo test` — proof `plan`/`select` let the
+    // command through instead of dying first.
+    assert_eq!(r.code, 0, "{}", r.stderr());
+    assert!(
+        r.stdout().contains("quadruples"),
+        "wscore's own integration test never ran:\n{}",
+        r.stdout()
+    );
+}
+
+/// Failure mode B: syncing only the member subtree left the server's copy
+/// without the root manifest `wscore`'s inherited `edition` depends on.
+#[test]
+fn member_dir_build_gets_the_synced_workspace_root() {
+    let rig = Rig::start("ws-member");
+    let r = rig.client_in(&ws_member("wscore"), &["check"]);
+
+    assert!(
+        !r.stderr().contains("failed to find a workspace root"),
+        "the root manifest never made it to the server:\n{}",
+        r.stderr()
+    );
+    assert_eq!(r.code, 0, "{}", r.stderr());
+}
+
+/// From the root, `-p` still picks out one member — and the server actually
+/// runs it, proving the sync carried both crates over and the flag reached
+/// cargo intact.
+#[test]
+fn dash_p_at_root_runs_the_named_member() {
+    let rig = Rig::start("ws-dash-p");
+    let r = rig.client_in(&ws_root(), &["run", "--remote", "-p", "wsbin"]);
+
+    assert_eq!(r.code, 0, "{}", r.stderr());
+    assert!(r.stdout().contains("WSBIN running"), "{}", r.stdout());
+}
+
+/// Recursively copies a fixture tree into a scratch dir, so a test that must
+/// corrupt a manifest never touches the shared fixture other tests read
+/// concurrently.
+fn copy_tree(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).expect("mkdir");
+    for entry in std::fs::read_dir(src).expect("read_dir") {
+        let entry = entry.expect("dir entry");
+        // Other tests build inside the shared fixture concurrently; its
+        // target/ is neither wanted here nor safe to copy mid-write.
+        if entry.file_name() == "target" {
+            continue;
+        }
+        let ty = entry.file_type().expect("file type");
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_tree(&from, &to);
+        } else {
+            std::fs::copy(&from, &to).expect("copy file");
+        }
+    }
+}
+
+/// A syntax-broken manifest is a real failure, not a "no manifest here" that
+/// falls back to the pre-workspace guess: `Meta::load` must surface cargo's
+/// own parse diagnostic and die, not silently swallow it into `Ok(None)`.
+#[test]
+fn corrupt_manifest_dies_loudly_instead_of_falling_back() {
+    let scratch = std::env::temp_dir().join(format!(
+        "rbuild-scratch-corrupt-offline-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_tree(&ws_root(), &scratch);
+    let root_manifest = scratch.join("Cargo.toml");
+    let original = std::fs::read_to_string(&root_manifest).expect("read root manifest");
+    std::fs::write(&root_manifest, format!("{original}\nnot valid toml [[[\n"))
+        .expect("corrupt root manifest");
+
+    let member = scratch.join("crates").join("wscore");
+    let r = offline_in(&member, &["check"]);
+
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    assert_eq!(r.code, 1, "{}", r.stderr());
+    assert!(
+        r.stderr().contains("failed to parse manifest"),
+        "cargo's own parse diagnostic never surfaced:\n{}",
+        r.stderr()
+    );
+}
+
+/// The failure mode `Meta::load` must not resurrect, shown against a real
+/// server: pre-fix, `Ok(None)` on the parse error fell back to guessing `cwd`
+/// as the sync root, so only `wscore`'s own subtree synced (never the root
+/// manifest), and the server died on an unrelated "failed to find a workspace
+/// root" — cargo's real parse diagnostic never appeared anywhere, and the
+/// sync went ahead at all. Post-fix, rbuild dies here, before ever syncing.
+#[test]
+fn corrupt_manifest_is_caught_before_a_partial_sync_reaches_the_server() {
+    let scratch = std::env::temp_dir().join(format!(
+        "rbuild-scratch-corrupt-online-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_tree(&ws_root(), &scratch);
+    let root_manifest = scratch.join("Cargo.toml");
+    let original = std::fs::read_to_string(&root_manifest).expect("read root manifest");
+    std::fs::write(&root_manifest, format!("{original}\nnot valid toml [[[\n"))
+        .expect("corrupt root manifest");
+
+    let rig = Rig::start("corrupt-manifest-live");
+    let member = scratch.join("crates").join("wscore");
+    let r = rig.client_in(&member, &["check"]);
+
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    assert_eq!(r.code, 1, "{}", r.stderr());
+    assert!(
+        r.stderr().contains("failed to parse manifest"),
+        "cargo's own parse diagnostic never surfaced:\n{}",
+        r.stderr()
+    );
+    assert!(
+        !r.stderr().contains("[rbuild] sync:"),
+        "a partial subtree sync reached the server instead of dying first:\n{}",
+        r.stderr()
+    );
+}
+
+/// `run` in a bin-less package (empty `--bin`/`--example`/... select, not just
+/// "more than one") must die cleanly, not index an empty Vec.
+#[test]
+fn run_in_binless_package_is_a_clean_error() {
+    let r = offline_in(&ws_member("wscore"), &["run"]);
+    assert_eq!(r.code, 1, "{}", r.stderr());
+    assert!(
+        r.stderr().contains("no executable target selected to run"),
+        "{}",
+        r.stderr()
+    );
+}
+
+/// A `-p` naming no real package is caught here, not after a build.
+#[test]
+fn unknown_dash_p_lists_the_real_packages() {
+    let r = offline_in(&ws_root(), &["build", "-p", "nosuchpkg"]);
+
+    assert_eq!(r.code, 1);
+    let err = r.stderr();
+    assert!(err.contains("no package named"), "{err}");
+    assert!(err.contains("wscore") && err.contains("wsbin"), "{err}");
+}
+
+/// `at_package` (the member dir cwd names) must never preempt an explicit
+/// `-p`/`--workspace` on the command line — only the injection it drives.
+/// From `wscore`'s own directory, `-p wsbin --test smoke` must select wsbin,
+/// not get silently steered back to wscore's target list.
+#[test]
+fn explicit_dash_p_overrides_at_package_from_a_member_dir() {
+    let r = offline_in(&ws_member("wscore"), &["build", "-p", "wsbin", "--test", "smoke"]);
+    assert_eq!(r.code, 0, "{}", r.stderr());
+}
+
+/// Same priority bug, the typo-check angle: `-p nosuchpkg` from a member dir
+/// must still be validated by rbuild itself, not silently forwarded to cargo
+/// because `at_package` ate the selection first.
+#[test]
+fn explicit_dash_p_typo_from_member_dir_is_still_caught() {
+    let r = offline_in(&ws_member("wscore"), &["build", "-p", "nosuchpkg"]);
+    assert_eq!(r.code, 1);
+    assert!(r.stderr().contains("no package named"), "{}", r.stderr());
+}
+
+/// `-p=name` (the `=`-joined attached form) must parse the same as `-p name`,
+/// not swallow the `=` into the package name.
+#[test]
+fn dash_p_equals_form_parses_the_name_without_the_equals() {
+    let r = offline_in(&ws_member("wscore"), &["build", "-p=wsbin", "--test", "smoke"]);
+    assert_eq!(r.code, 0, "{}", r.stderr());
+}
+
+/// `-pname` (cargo's attached short-flag form) must count as explicit
+/// selection too, or `at_package`'s injection doubles up alongside it.
+#[test]
+fn attached_dash_p_form_counts_as_explicit_selection() {
+    let r = offline_in(&ws_member("wscore"), &["build", "-pwsbin", "--test", "smoke"]);
+    assert_eq!(r.code, 0, "{}", r.stderr());
+}
+
+/// `--all` is cargo's deprecated spelling of `--workspace`.
+#[test]
+fn dash_dash_all_selects_the_whole_workspace() {
+    let r = offline_in(&ws_root(), &["build", "--all", "--test", "nosuch"]);
+    assert_eq!(r.code, 1);
+    assert!(r.stderr().contains("Available: it, smoke"), "{}", r.stderr());
+}
+
+/// The typo-check's "Available" list is scoped to whichever package set the
+/// command line actually selected: `-p wscore` alone never offers `wsbin`'s
+/// targets, `--workspace` (and the bare default, which resolves to the same
+/// set in this fixture) offers both.
+#[test]
+fn typo_check_lists_only_the_selected_packages() {
+    let one = offline_in(&ws_root(), &["build", "-p", "wscore", "--test", "nosuch"]);
+    assert_eq!(one.code, 1);
+    assert!(one.stderr().contains("Available: it"), "{}", one.stderr());
+    // "Available: it" is also a prefix of the wrongly-scoped "Available: it,
+    // smoke" — assert the exclusion directly, not just the substring match.
+    assert!(!one.stderr().contains("smoke"), "{}", one.stderr());
+
+    let other = offline_in(&ws_root(), &["build", "-p", "wsbin", "--test", "nosuch"]);
+    assert_eq!(other.code, 1);
+    assert!(other.stderr().contains("Available: smoke"), "{}", other.stderr());
+
+    let all = offline_in(&ws_root(), &["build", "--workspace", "--test", "nosuch"]);
+    assert_eq!(all.code, 1);
+    assert!(all.stderr().contains("Available: it, smoke"), "{}", all.stderr());
+
+    let bare = offline_in(&ws_root(), &["build", "--test", "nosuch"]);
+    assert_eq!(bare.code, 1);
+    assert!(bare.stderr().contains("Available: it, smoke"), "{}", bare.stderr());
 }
