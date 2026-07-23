@@ -24,3 +24,4 @@ rustc-ice-*.txt
 #.idea/
 # The protocol fixture crate is built by tests/remote.rs, never published.
 tests/fixtures/probe/Cargo.lock
+tests/fixtures/wsprobe/Cargo.lock

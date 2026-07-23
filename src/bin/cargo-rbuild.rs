@@ -115,8 +115,27 @@ fn main() -> ExitCode {
         Ok(d) => d,
         Err(e) => return die(&format!("cwd: {e}")),
     };
-    let Some(proj) = cwd.file_name().and_then(|s| s.to_str()).map(String::from) else {
-        return die("cannot derive project name from cwd");
+
+    // A workspace has one manifest tree and one target dir, at its root — never
+    // at whichever member directory the user happened to invoke us from. Every
+    // subcommand syncs and builds against that root; `cwd` still means "where
+    // the user typed the command" everywhere else (running the fetched exe,
+    // the local fallback).
+    let meta = match Meta::load(&cwd, &cargo_args) {
+        Ok(m) => m,
+        // A real project, but this command line makes no sense against it —
+        // an unknown -p, an unsupported --exclude. Say so now; there is no
+        // fallback that would make it any less wrong.
+        Err(e) => return die(&e),
+    };
+    let sync_root = match &meta {
+        Some(m) => m.workspace_root.clone(),
+        // No metadata to learn a root from — the old guess, unwilling to touch
+        // anything above cwd.
+        None => cwd.clone(),
+    };
+    let Some(proj) = sync_root.file_name().and_then(|s| s.to_str()).map(String::from) else {
+        return die("cannot derive project name from the workspace root");
     };
     if !valid_project(&proj) {
         return die(&format!(
@@ -124,15 +143,27 @@ fn main() -> ExitCode {
         ));
     }
 
-    // Only a cross build leaves behind a binary this machine can run.
-    let fetching = !exec && !native && matches!(sub.as_str(), "build");
-
     // What the user actually typed, for a fallback that has no server to plan
     // around.
     let typed = cargo_args.clone();
 
+    // cwd names one package inside a bigger workspace: the server's cargo runs
+    // at the synced root, so it needs telling which package `cwd` meant. Not if
+    // the user already said so themselves.
+    if let Some(m) = &meta {
+        if let Some(pkg) = &m.at_package {
+            if !m.is_workspace_root && !m.explicit_selection {
+                cargo_args.push("-p".into());
+                cargo_args.push(pkg.clone());
+            }
+        }
+    }
+
+    // Only a cross build leaves behind a binary this machine can run.
+    let fetching = !exec && !native && matches!(sub.as_str(), "build");
+
     if fetching {
-        if let Err(e) = plan(&cwd, &proj, &orig_sub, here, &mut cargo_args) {
+        if let Err(e) = plan(&proj, &orig_sub, here, &mut cargo_args, &meta) {
             return die(&e);
         }
     }
@@ -151,7 +182,7 @@ fn main() -> ExitCode {
     };
 
     let built = match remote(
-        &cwd,
+        &sync_root,
         &proj,
         &sub,
         &cargo_args,
@@ -244,11 +275,11 @@ enum Mode {
 /// a binary back. `build` can, so that is what the server is asked for, with the
 /// target flags the original subcommand implies.
 fn plan(
-    cwd: &Path,
     proj: &str,
     sub: &str,
     here: Local,
     args: &mut Vec<String>,
+    meta: &Option<Meta>,
 ) -> Result<(), String> {
     if args.iter().any(|a| a.starts_with("--message-format")) {
         return Err("rbuild needs --message-format for itself: it reads cargo's JSON to learn \
@@ -262,7 +293,7 @@ fn plan(
         // watches something they didn't ask for. `select` refuses instead, and
         // then says out loud which target the bare `run` meant.
         "run" => {
-            let one = select(cwd, proj, args, true)?;
+            let one = select(meta, proj, args, true)?;
             if !chosen {
                 args.extend(one[0].flag());
             }
@@ -282,16 +313,16 @@ fn plan(
                 args.push("--profile".into());
                 args.push("bench".into());
             }
-            select(cwd, proj, args, false)?;
+            select(meta, proj, args, false)?;
         }
         "test" => {
             if !chosen {
                 args.push("--tests".into());
             }
-            select(cwd, proj, args, false)?;
+            select(meta, proj, args, false)?;
         }
         _ => {
-            select(cwd, proj, args, false)?;
+            select(meta, proj, args, false)?;
         }
     }
 
@@ -403,20 +434,27 @@ fn parse_flags(args: &[String]) -> Result<Vec<Flag>, String> {
 /// `run` demands exactly one, so `rbuild run` can never launch a target other
 /// than the one that was asked for. Which file each becomes is cargo's business,
 /// not ours: it reports that in its JSON once the build has run.
-fn select(cwd: &Path, proj: &str, args: &[String], run: bool) -> Result<Vec<Artifact>, String> {
+fn select(
+    meta: &Option<Meta>,
+    proj: &str,
+    args: &[String],
+    run: bool,
+) -> Result<Vec<Artifact>, String> {
     let flags = parse_flags(args)?;
-    let meta = Meta::load(cwd);
 
     if flags.is_empty() {
         // cargo's default for `build`: the lib and every bin.
         let mut bins = match &meta {
-            Ok(m) => m.named(Kind::Bin).to_vec(),
+            Some(m) => m.named(Kind::Bin).to_vec(),
             // No manifest to read: the old guess, which is right for the common
             // single-bin crate and is what the remote build will look for too.
-            Err(_) => vec![proj.to_string()],
+            None => vec![proj.to_string()],
         };
+        if run && bins.is_empty() {
+            return Err("no executable target selected to run".into());
+        }
         if run && bins.len() > 1 {
-            let Some(d) = meta.as_ref().ok().and_then(|m| m.default_run.clone()) else {
+            let Some(d) = meta.as_ref().and_then(|m| m.default_run.clone()) else {
                 bins.sort();
                 return Err(format!(
                     "{} binaries ({}) and no `default-run` — say which with --bin <name>",
@@ -436,7 +474,9 @@ fn select(cwd: &Path, proj: &str, args: &[String], run: bool) -> Result<Vec<Arti
     for f in &flags {
         // The plural flags name no targets, so only they need the manifest.
         let listed = |k: Kind| -> Result<Vec<Artifact>, String> {
-            let m = meta.as_ref().map_err(Clone::clone)?;
+            let m = meta
+                .as_ref()
+                .ok_or("no manifest to read here, so a plural target flag has nothing to list")?;
             Ok(m.named(k)
                 .iter()
                 .cloned()
@@ -457,7 +497,7 @@ fn select(cwd: &Path, proj: &str, args: &[String], run: bool) -> Result<Vec<Arti
 
     // A name cargo doesn't know is a typo, and the remote build would fail on it
     // anyway. Say so before spending a build on it.
-    if let Ok(m) = &meta {
+    if let Some(m) = &meta {
         for a in &out {
             let known = m.named(a.kind);
             if !known.contains(&a.name) {
@@ -467,7 +507,7 @@ fn select(cwd: &Path, proj: &str, args: &[String], run: bool) -> Result<Vec<Arti
                     "no {} target named {:?} in {}. Available: {}",
                     a.kind.word(),
                     a.name,
-                    m.package,
+                    m.label(),
                     if names.is_empty() {
                         "(none)".into()
                     } else {
@@ -497,13 +537,33 @@ fn select(cwd: &Path, proj: &str, args: &[String], run: bool) -> Result<Vec<Arti
     Ok(out)
 }
 
-/// The target names cargo knows for this package, straight from its manifest.
+/// The target names cargo knows for the selected package(s), straight from the
+/// manifest, plus enough of the workspace shape to sync and route correctly.
 struct Meta {
-    package: String,
+    /// The one tree cargo actually builds from. Always the workspace root —
+    /// even a standalone, non-workspace package reports itself as one.
+    workspace_root: PathBuf,
+    /// True when `cwd` *is* that root, so nothing needs telling the server
+    /// which package `cwd` meant.
+    is_workspace_root: bool,
+    /// The package whose manifest is `cwd`'s, if any. Only stands in for an
+    /// unstated selection — an explicit `-p`/`--package`/`--workspace` on the
+    /// command line always wins, the same way plain `cargo` lets a flag
+    /// override the directory you're standing in.
+    at_package: Option<String>,
+    /// True if the command line already carried `-p`/`--package`/`--workspace`,
+    /// so nothing here should add another one.
+    explicit_selection: bool,
+    /// The packages this invocation resolved to: the `-p`/`--workspace`
+    /// flags, or `at_package` when neither was said, or the workspace's own
+    /// default members when neither `at_package` applies either.
+    selected: Vec<String>,
     bins: Vec<String>,
     examples: Vec<String>,
     tests: Vec<String>,
     benches: Vec<String>,
+    /// Only set when exactly one package is selected — with more than one on
+    /// the table, "the default binary" isn't a well-formed question.
     default_run: Option<String>,
 }
 
@@ -516,15 +576,29 @@ impl Meta {
             Kind::Bench => &self.benches,
         }
     }
+
+    /// How the selected package set reads in an error message.
+    fn label(&self) -> String {
+        match self.selected.as_slice() {
+            [one] => one.clone(),
+            many => format!("{{{}}}", many.join(", ")),
+        }
+    }
 }
 
 #[derive(Deserialize)]
 struct MetaJson {
     packages: Vec<PkgJson>,
+    workspace_root: String,
+    /// Absent on a cargo old enough not to report it; `Meta::load` falls back
+    /// to every member when that happens.
+    #[serde(default)]
+    workspace_default_members: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
 struct PkgJson {
+    id: String,
     name: String,
     manifest_path: String,
     default_run: Option<String>,
@@ -538,25 +612,105 @@ struct TgtJson {
     crate_types: Vec<String>,
 }
 
+/// What `-p`/`--package`/`--workspace` on the command line asked for.
+enum PkgSel {
+    Named(Vec<String>),
+    Workspace,
+    /// Neither flag was present — cargo's own bare-invocation default.
+    Default,
+}
+
+/// The package-selection flags in `args`. Unlike [`parse_flags`], this only
+/// looks for the handful that pick *which package*, not which target inside
+/// one; the rest of `args` passes through untouched.
+fn parse_package_selection(args: &[String]) -> Result<PkgSel, String> {
+    let mut names = Vec::new();
+    let mut workspace = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        // `-p` alone takes cargo's short-option attached form too: `-pfoo`
+        // means the same as `-p foo`, no `=` involved. `-p=foo` is the same
+        // again — the leading `=` is stripped here, never part of the name.
+        if let Some(name) = a.strip_prefix("-p").filter(|rest| !rest.is_empty()) {
+            if !a.starts_with("--") {
+                names.push(name.strip_prefix('=').unwrap_or(name).to_string());
+                continue;
+            }
+        }
+        let (head, attached) = match a.split_once('=') {
+            Some((h, v)) => (h, Some(v.to_string())),
+            None => (a.as_str(), None),
+        };
+        match head {
+            "-p" | "--package" => {
+                match attached.clone().or_else(|| it.next().cloned()) {
+                    Some(v) if !v.starts_with('-') => names.push(v),
+                    _ => return Err(format!("{head} needs a package name")),
+                }
+            }
+            // `--all` is cargo's deprecated spelling of `--workspace`.
+            "--workspace" | "--all" => workspace = true,
+            // Handling this properly means excluding members from a set this
+            // module otherwise treats as a flat list — more than a flag parse.
+            // Silently dropping it would build the wrong set instead.
+            "--exclude" => {
+                return Err(
+                    "rbuild doesn't support --exclude yet — select packages with -p instead"
+                        .into(),
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(if workspace {
+        PkgSel::Workspace
+    } else if !names.is_empty() {
+        PkgSel::Named(names)
+    } else {
+        PkgSel::Default
+    })
+}
+
 impl Meta {
-    /// Reads the manifest only — works even when the crate doesn't compile.
-    fn load(cwd: &Path) -> Result<Meta, String> {
+    /// `Ok(None)` means there's no manifest to read at all — not a cargo
+    /// directory, so every caller falls back to its own pre-workspace guess.
+    /// `Err` means there is one, but what this command line asked of it (an
+    /// unknown `-p`, an unsupported `--exclude`) doesn't parse against it —
+    /// that's a real failure, not something to quietly work around.
+    fn load(cwd: &Path, args: &[String]) -> Result<Option<Meta>, String> {
         let out = Command::new("cargo")
             .args(["metadata", "--no-deps", "--format-version=1"])
             .current_dir(cwd)
-            .output()
-            .map_err(|e| format!("cargo metadata: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "cargo metadata: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        let meta: MetaJson =
-            serde_json::from_slice(&out.stdout).map_err(|e| format!("cargo metadata: {e}"))?;
+            .output();
+        let meta: MetaJson = match out {
+            Ok(out) if out.status.success() => match serde_json::from_slice(&out.stdout) {
+                Ok(m) => m,
+                Err(_) => return Ok(None),
+            },
+            // Not a cargo directory at all is the one failure with a fallback
+            // that makes sense; anything else cargo said about this manifest
+            // (a parse error, a broken workspace) is a real failure to report,
+            // not to quietly swallow — swallowing it here would fall back to
+            // guessing cwd as the sync root, syncing only a member's subtree
+            // and leaving the server to fail on a missing workspace root
+            // instead of on the diagnostic that actually explains it.
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if stderr.contains("could not find `Cargo.toml`") {
+                    return Ok(None);
+                }
+                return Err(stderr.trim_end().to_string());
+            }
+            Err(_) => return Ok(None),
+        };
+
+        let workspace_root = PathBuf::from(&meta.workspace_root);
+        let root_here = fs::canonicalize(&workspace_root).ok();
+        let cwd_here = fs::canonicalize(cwd).ok();
+        let is_workspace_root = root_here.is_some() && root_here == cwd_here;
 
         let here = fs::canonicalize(cwd.join("Cargo.toml")).ok();
-        let pkg = meta
+        let at_package = meta
             .packages
             .iter()
             .find(|p| fs::canonicalize(&p.manifest_path).ok() == here)
@@ -564,26 +718,90 @@ impl Meta {
                 [only] => Some(only),
                 _ => None,
             })
-            .ok_or("cwd is a workspace root, not a package — run rbuild from a package dir")?;
+            .map(|p| p.name.clone());
+
+        let sel = parse_package_selection(args)?;
+        let explicit_selection = !matches!(sel, PkgSel::Default);
+
+        let all_names: Vec<String> = meta.packages.iter().map(|p| p.name.clone()).collect();
+        // Explicit -p/--package/--workspace always wins; `at_package` (cwd's own
+        // package) only matters when the command line left selection unsaid, and
+        // even then it's the injection below's business, not a third case here.
+        let selected: Vec<String> = match sel {
+            PkgSel::Named(names) => {
+                for n in &names {
+                    if !all_names.contains(n) {
+                        let mut avail = all_names.clone();
+                        avail.sort();
+                        return Err(format!(
+                            "no package named {n:?} in this workspace. Available: {}",
+                            if avail.is_empty() {
+                                "(none)".into()
+                            } else {
+                                avail.join(", ")
+                            }
+                        ));
+                    }
+                }
+                names
+            }
+            PkgSel::Workspace => all_names.clone(),
+            PkgSel::Default => {
+                if let Some(name) = &at_package {
+                    vec![name.clone()]
+                } else {
+                    match &meta.workspace_default_members {
+                        Some(ids) => {
+                            let named: Vec<String> = meta
+                                .packages
+                                .iter()
+                                .filter(|p| ids.contains(&p.id))
+                                .map(|p| p.name.clone())
+                                .collect();
+                            if named.is_empty() {
+                                all_names.clone()
+                            } else {
+                                named
+                            }
+                        }
+                        None => all_names.clone(),
+                    }
+                }
+            }
+        };
+
+        let pkgs: Vec<&PkgJson> = meta
+            .packages
+            .iter()
+            .filter(|p| selected.contains(&p.name))
+            .collect();
 
         // An example may be a lib (`crate-type = ["cdylib"]`); only bins run.
         let named = |k: &str| -> Vec<String> {
-            pkg.targets
-                .iter()
+            pkgs.iter()
+                .flat_map(|p| p.targets.iter())
                 .filter(|t| {
                     t.kind.iter().any(|x| x == k) && t.crate_types.iter().any(|c| c == "bin")
                 })
                 .map(|t| t.name.clone())
                 .collect()
         };
-        Ok(Meta {
-            package: pkg.name.clone(),
+        let default_run = match pkgs.as_slice() {
+            [only] => only.default_run.clone(),
+            _ => None,
+        };
+        Ok(Some(Meta {
+            workspace_root,
+            is_workspace_root,
+            at_package,
+            explicit_selection,
+            selected,
             bins: named(Kind::Bin.word()),
             examples: named(Kind::Example.word()),
             tests: named(Kind::Test.word()),
             benches: named(Kind::Bench.word()),
-            default_run: pkg.default_run.clone(),
-        })
+            default_run,
+        }))
     }
 }
 
@@ -596,7 +814,7 @@ struct Built {
 
 #[allow(clippy::too_many_arguments)]
 fn remote(
-    cwd: &Path,
+    sync_root: &Path,
     proj: &str,
     sub: &str,
     cargo_args: &[String],
@@ -645,7 +863,7 @@ fn remote(
 
     // ---- sync -----------------------------------------------------------
     let t = Instant::now();
-    let local_files = scan_local(cwd)?;
+    let local_files = scan_local(sync_root)?;
 
     let remote_files: HashMap<String, FileHeader> = if full {
         HashMap::new()
@@ -690,7 +908,7 @@ fn remote(
                 files: upload.clone(),
             },
         )?;
-        let sent = stream_bodies(&mut w, cwd, &upload)?;
+        let sent = stream_bodies(&mut w, sync_root, &upload)?;
         w.flush()?;
 
         match recv::<ServerMsg, _>(&mut r)? {
@@ -786,12 +1004,12 @@ fn remote(
                 "cargo reported a binary outside the target dir: {exe}"
             )));
         };
-        let dst = cwd.join("target").join("remote").join(
+        let dst = sync_root.join("target").join("remote").join(
             rel.trim_start_matches(t)
                 .trim_start_matches('/')
                 .replace('/', MAIN_SEPARATOR_STR),
         );
-        fetch(&mut r, &mut w, cwd, proj, &rel, &dst)?;
+        fetch(&mut r, &mut w, sync_root, proj, &rel, &dst)?;
         exes.push(dst);
     }
 
