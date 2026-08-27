@@ -408,6 +408,25 @@ fn ambiguity_is_refused() {
     assert!(r.stderr().contains("no example target"), "{}", r.stderr());
 }
 
+/// An explicitly native build is server-only: a transport failure must never
+/// silently turn it into a local cargo invocation.
+#[test]
+fn native_build_does_not_fall_back_when_the_server_is_unreachable() {
+    let r = offline(&["check", "--native"]);
+
+    assert_eq!(
+        r.code,
+        1,
+        "an explicit native build must fail remotely\n{}",
+        r.stderr()
+    );
+    assert!(
+        r.stderr().contains("remote build:"),
+        "the remote failure was not reported:\n{}",
+        r.stderr()
+    );
+}
+
 // ---- workspaces -----------------------------------------------------------
 //
 // `wsprobe` is a real two-crate workspace: a virtual root with an inherited

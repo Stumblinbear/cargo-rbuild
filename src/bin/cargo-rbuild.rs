@@ -56,6 +56,7 @@ fn main() -> ExitCode {
     let full = raw.iter().any(|a| a == "--full");
     let native = raw.iter().any(|a| a == "--native");
     let exec = raw.iter().any(|a| a == "--remote");
+    let explicit_server_mode = exec || native;
     let mut rest: Vec<String> = raw
         .into_iter()
         .filter(|a| !matches!(a.as_str(), "--full" | "--native" | "--remote"))
@@ -186,21 +187,23 @@ fn main() -> ExitCode {
         &proj,
         &sub,
         &cargo_args,
-        if exec || native { None } else { Some(TARGET) },
+        if explicit_server_mode {
+            None
+        } else {
+            Some(TARGET)
+        },
         trailing,
         mode,
         full,
     ) {
         Ok(b) => b,
 
-        // Falling back would run the program on the wrong machine, which is the
-        // one thing --remote was asked not to do.
-        Err(e) if exec => {
-            return die(&format!(
-                "remote run: {e}\n  If the host is up, its rbuild-server may predate --remote, \
-                 which drops the connection right here. Rebuild and restart it: \
-                 cargo build --release --bin rbuild-server"
-            ));
+        // An explicit server mode must not silently fall back to local cargo.
+        Err(e) if explicit_server_mode => {
+            if exec {
+                return die(&format!("remote run: {e}"));
+            }
+            return die(&format!("remote build: {e}"));
         }
 
         Err(e) => {
