@@ -517,6 +517,59 @@ fn copy_tree(src: &Path, dst: &Path) {
     }
 }
 
+/// A crate deleted locally left its directory on the server: the push removed
+/// its files one by one and nothing removed the directory they emptied, so a
+/// workspace listing its members as `crates/*` failed its next manifest load
+/// there on a member with no `Cargo.toml`.
+#[test]
+fn a_deleted_crate_takes_its_directory_off_the_server() {
+    let scratch = std::env::temp_dir().join(format!(
+        "rbuild-scratch-deleted-crate-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_tree(&ws_root(), &scratch);
+    let root_manifest = scratch.join("Cargo.toml");
+    let original = std::fs::read_to_string(&root_manifest).expect("read root manifest");
+    std::fs::write(
+        &root_manifest,
+        original.replace(
+            "members = [\"crates/wscore\", \"crates/wsbin\"]",
+            "members = [\"crates/*\"]",
+        ),
+    )
+    .expect("glob the members");
+    let extra = scratch.join("crates").join("wsextra");
+    std::fs::create_dir_all(extra.join("src")).expect("mkdir wsextra");
+    std::fs::write(
+        extra.join("Cargo.toml"),
+        "[package]\nname = \"wsextra\"\nversion = \"0.1.0\"\nedition.workspace = true\n",
+    )
+    .expect("write wsextra manifest");
+    std::fs::write(extra.join("src").join("lib.rs"), "pub fn extra() {}\n").expect("write lib");
+
+    let rig = Rig::start("ws-deleted-crate");
+    let before = rig.client_in(&scratch, &["check"]);
+    assert_eq!(before.code, 0, "{}", before.stderr());
+
+    std::fs::remove_dir_all(&extra).expect("delete wsextra");
+    let after = rig.client_in(&scratch, &["check"]);
+
+    let project = scratch.file_name().and_then(|s| s.to_str()).expect("scratch name");
+    let remote_extra = rig.remote_project(project).join("crates").join("wsextra");
+    let kept = remote_extra.exists();
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    assert_eq!(
+        after.code,
+        0,
+        "the server kept the deleted crate's directory:
+{}",
+        after.stderr()
+    );
+    assert!(!kept, "{} is still on the server", remote_extra.display());
+}
+
 /// A syntax-broken manifest is a real failure, not a "no manifest here" that
 /// falls back to the pre-workspace guess: `Meta::load` must surface cargo's
 /// own parse diagnostic and die, not silently swallow it into `Ok(None)`.

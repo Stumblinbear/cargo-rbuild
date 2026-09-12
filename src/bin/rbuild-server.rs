@@ -160,6 +160,7 @@ fn serve(stream: TcpStream, authorized: &[PublicKey], host_key: &PrivateKey) -> 
                         let _ = fs::remove_file(dir.join(d));
                     }
                 }
+                prune_empty_dirs(&dir);
 
                 let mut received = 0u64;
                 let mut buf = vec![0u8; CHUNK];
@@ -431,6 +432,25 @@ fn spawn_pump<R: Read + Send + 'static>(
             }
         }
     })
+}
+
+/// Removes every directory under `dir` that holds no file, bottom up, `dir`
+/// itself kept. The client syncs files alone, so a directory with none is
+/// nothing it has; a deleted crate's directory would otherwise stay, and cargo
+/// reads a `crates/*` workspace member from its directory, failing on one
+/// with no manifest.
+fn prune_empty_dirs(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            let p = e.path();
+            prune_empty_dirs(&p);
+            // Refused while anything is left inside, which is the test.
+            let _ = fs::remove_dir(&p);
+        }
+    }
 }
 
 fn walk(root: &Path, dir: &Path, out: &mut Vec<FileHeader>) {
