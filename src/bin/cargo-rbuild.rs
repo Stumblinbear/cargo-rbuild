@@ -23,6 +23,19 @@
 //!   rbuild bench --remote --bench perf
 //!   rbuild test --remote       includes the doctests, which cannot be fetched
 //!
+//! `--include <glob>` sends a file the ignore rules hold back, a crate's
+//! config.toml or a key a test reads. Repeatable; globs are relative to the
+//! sync root, so `config.toml` is the one at the root and `**/config.toml` is
+//! every crate's. No ignore file applies to what a glob names; `.git` and
+//! `target` stay behind whatever it names.
+//!
+//! The flag covers one run. Drop it from the next and the sync takes the file
+//! back off the server, the same as deleting it here. Bodies cross the LAN
+//! unencrypted and land in the builder's source tree as plain files, so a glob
+//! naming a secret hands it to both.
+//!
+//!   rbuild test --remote --include config.toml
+//!
 //! Env:
 //!   RBUILD_HOST   default "truenas.lan"
 //!   RBUILD_PORT   default 7878
@@ -37,6 +50,7 @@ use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use cargo_rbuild::*;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use serde::Deserialize;
 use ssh_key::{HashAlg, LineEnding, PrivateKey};
@@ -53,14 +67,24 @@ fn main() -> ExitCode {
         raw.remove(0);
     }
 
-    let full = raw.iter().any(|a| a == "--full");
-    let native = raw.iter().any(|a| a == "--native");
-    let exec = raw.iter().any(|a| a == "--remote");
+    let Own {
+        full,
+        native,
+        exec,
+        includes,
+        mut rest,
+    } = match take_own_flags(raw) {
+        Ok(own) => own,
+        Err(e) => return die(&e),
+    };
     let explicit_server_mode = exec || native;
-    let mut rest: Vec<String> = raw
-        .into_iter()
-        .filter(|a| !matches!(a.as_str(), "--full" | "--native" | "--remote"))
-        .collect();
+
+    // Compiled before anything connects: a bad glob is a usage error, not a
+    // sync that dies half way.
+    let includes = match Includes::compile(includes) {
+        Ok(set) => set,
+        Err(e) => return die(&e),
+    };
 
     let mut sub = if rest.is_empty() {
         "build".into()
@@ -195,6 +219,7 @@ fn main() -> ExitCode {
         trailing,
         mode,
         full,
+        &includes,
     ) {
         Ok(b) => b,
 
@@ -258,6 +283,80 @@ enum Local {
     /// Every binary the build produced, in the order cargo reported them, the
     /// way `cargo test` and `cargo bench` work through theirs.
     Every,
+}
+
+/// rbuild's own flags, taken off the command line before cargo sees any of it.
+#[derive(Default)]
+struct Own {
+    full: bool,
+    native: bool,
+    /// `--remote`: the server runs what it built, and nothing comes back.
+    exec: bool,
+    includes: Vec<String>,
+    /// Everything rbuild didn't claim, in the order it was typed.
+    rest: Vec<String>,
+}
+
+/// Splits rbuild's flags from cargo's.
+///
+/// Reading stops at `--`: past it the words are a program's own argv, and a
+/// program is entitled to an argument spelled like one of ours.
+///
+/// `Err` is the usage message for an `--include` given no glob.
+fn take_own_flags(raw: Vec<String>) -> Result<Own, String> {
+    let mut own = Own::default();
+    let mut it = raw.into_iter();
+
+    while let Some(a) = it.next() {
+        if a == "--" {
+            own.rest.push(a);
+            own.rest.extend(it);
+            break;
+        }
+
+        match a.as_str() {
+            "--full" => own.full = true,
+            "--native" => own.native = true,
+            "--remote" => own.exec = true,
+            // A word starting with `-` is a forgotten glob, not a filename.
+            "--include" => match it.next() {
+                Some(g) if !g.starts_with('-') => own.includes.push(g),
+                _ => return Err("--include needs a glob".into()),
+            },
+            _ => match a.strip_prefix("--include=") {
+                Some("") => return Err("--include needs a glob".into()),
+                Some(g) => own.includes.push(g.to_string()),
+                None => own.rest.push(a),
+            },
+        }
+    }
+
+    Ok(own)
+}
+
+/// The `--include` globs and the matcher they compile to. Empty when the flag
+/// never appeared.
+struct Includes {
+    /// As typed, so a run can name the ones that matched nothing.
+    globs: Vec<String>,
+    set: GlobSet,
+}
+
+impl Includes {
+    fn compile(globs: Vec<String>) -> Result<Includes, String> {
+        let mut set = GlobSetBuilder::new();
+        for g in &globs {
+            let glob = Glob::new(g).map_err(|e| format!("--include {g:?}: {e}"))?;
+            set.add(glob);
+        }
+        let set = set.build().map_err(|e| format!("--include: {e}"))?;
+
+        Ok(Includes { globs, set })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.globs.is_empty()
+    }
 }
 
 /// What the server is being asked for.
@@ -825,6 +924,7 @@ fn remote(
     trailing: &[String],
     mode: Mode,
     full: bool,
+    includes: &Includes,
 ) -> io::Result<Built> {
     let host = std::env::var("RBUILD_HOST").unwrap_or_else(|_| "truenas.lan".into());
     let port: u16 = std::env::var("RBUILD_PORT")
@@ -866,31 +966,44 @@ fn remote(
 
     // ---- sync -----------------------------------------------------------
     let t = Instant::now();
-    let local_files = scan_local(sync_root)?;
+    let Scan {
+        files: local_files,
+        unmatched,
+    } = scan_local(sync_root, includes)?;
 
-    let remote_files: HashMap<String, FileHeader> = if full {
-        HashMap::new()
-    } else {
-        send(
-            &mut w,
-            &ClientMsg::Manifest {
-                project: proj.into(),
-            },
-        )?;
-        match recv::<ServerMsg, _>(&mut r)? {
-            ServerMsg::Manifest(v) => v.into_iter().map(|h| (h.path.clone(), h)).collect(),
-            ServerMsg::Error(e) => return Err(io::Error::other(e)),
-            _ => return Err(io::Error::other("expected Manifest")),
-        }
+    // A glob that matched nothing looks just like one that worked, and the file
+    // it named is the one the build is missing.
+    if !unmatched.is_empty() {
+        eprintln!(
+            "[rbuild] --include matched nothing: {}",
+            unmatched.join(", ")
+        );
+    }
+
+    // Asked for on every run, `--full` included: it is the only word on what is
+    // up there, and a file this run doesn't have, deleted or dropped from
+    // `--include`, still has to come off.
+    send(
+        &mut w,
+        &ClientMsg::Manifest {
+            project: proj.into(),
+        },
+    )?;
+    let remote_files: HashMap<String, FileHeader> = match recv::<ServerMsg, _>(&mut r)? {
+        ServerMsg::Manifest(v) => v.into_iter().map(|h| (h.path.clone(), h)).collect(),
+        ServerMsg::Error(e) => return Err(io::Error::other(e)),
+        _ => return Err(io::Error::other("expected Manifest")),
     };
 
     // rsync's quick check: size or mtime differs -> resend. 1s tolerance,
     // because NTFS and ext4 disagree about granularity.
     let mut upload: Vec<FileHeader> = local_files
         .values()
-        .filter(|h| match remote_files.get(&h.path) {
-            Some(rh) => rh.size != h.size || (rh.mtime - h.mtime).abs() > 1,
-            None => true,
+        .filter(|h| {
+            full || match remote_files.get(&h.path) {
+                Some(rh) => rh.size != h.size || (rh.mtime - h.mtime).abs() > 1,
+                None => true,
+            }
         })
         .cloned()
         .collect();
@@ -1216,54 +1329,108 @@ fn stream_bodies<W: Write>(w: &mut W, root: &Path, files: &[FileHeader]) -> io::
     Ok(sent)
 }
 
-/// Honours .gitignore. Dotfiles included (.cargo/config.toml is real);
-/// .git and target/ never are.
-fn scan_local(root: &Path) -> io::Result<HashMap<String, FileHeader>> {
-    let mut out = HashMap::new();
-    let walker = WalkBuilder::new(root)
+/// What the local tree holds, and which `--include` globs named nothing.
+struct Scan {
+    files: HashMap<String, FileHeader>,
+    unmatched: Vec<String>,
+}
+
+/// The files to sync, keyed by path relative to `root`: everything the ignore
+/// files leave, plus everything an `includes` glob names. Dotfiles count
+/// (.cargo/config.toml is real); `.git` and `target` never do.
+fn scan_local(root: &Path, includes: &Includes) -> io::Result<Scan> {
+    let mut files = HashMap::new();
+
+    for entry in walk(root, true).flatten() {
+        if let Some((rel, header)) = header_for(root, &entry) {
+            files.insert(rel, header);
+        }
+    }
+
+    let mut hit = vec![false; includes.globs.len()];
+
+    // A second walk with the ignore files off: the first never yields what it
+    // ignored, so there is nothing to re-admit in a single pass.
+    if !includes.is_empty() {
+        for entry in walk(root, false).flatten() {
+            let Some((rel, header)) = header_for(root, &entry) else {
+                continue;
+            };
+            let matched = includes.set.matches(&rel);
+            if matched.is_empty() {
+                continue;
+            }
+            for i in matched {
+                hit[i] = true;
+            }
+            files.insert(rel, header);
+        }
+    }
+
+    let unmatched = includes
+        .globs
+        .iter()
+        .zip(hit)
+        .filter(|(_, hit)| !hit)
+        .map(|(glob, _)| glob.clone())
+        .collect();
+
+    Ok(Scan { files, unmatched })
+}
+
+/// A walker over `root`. With `ignores` off it answers to no ignore file at
+/// all: not .gitignore, not .ignore, not a parent directory's.
+///
+/// `.git` and `target` stay out either way. One holds the history, the other is
+/// build output the server has its own copy of.
+fn walk(root: &Path, ignores: bool) -> ignore::Walk {
+    WalkBuilder::new(root)
         .hidden(false)
-        .git_ignore(true)
+        .ignore(ignores)
+        .git_ignore(ignores)
         .git_global(false)
-        .git_exclude(true)
+        .git_exclude(ignores)
+        .parents(ignores)
         .filter_entry(|e| {
             let n = e.file_name();
             n != ".git" && n != "target"
         })
-        .build();
+        .build()
+}
 
-    for entry in walker.flatten() {
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-            continue;
-        }
-        let Ok(md) = entry.metadata() else { continue };
-        let Ok(rel) = entry.path().strip_prefix(root) else {
-            continue;
-        };
-        let rel = rel
-            .components()
-            .filter_map(|c| c.as_os_str().to_str())
-            .collect::<Vec<_>>()
-            .join("/");
-        if rel.is_empty() || !valid_rel(&rel) {
-            continue;
-        }
-        let Ok(modified) = md.modified() else {
-            continue;
-        };
-        let mtime = modified
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        out.insert(
-            rel.clone(),
-            FileHeader {
-                path: rel,
-                size: md.len(),
-                mtime,
-            },
-        );
+/// The entry's path relative to `root`, in the wire's spelling, and its header.
+/// `None` for anything that isn't a readable file with a name safe to send.
+fn header_for(root: &Path, entry: &ignore::DirEntry) -> Option<(String, FileHeader)> {
+    if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+        return None;
     }
-    Ok(out)
+    let md = entry.metadata().ok()?;
+    let rel = entry
+        .path()
+        .strip_prefix(root)
+        .ok()?
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect::<Vec<_>>()
+        .join("/");
+    if rel.is_empty() || !valid_rel(&rel) {
+        return None;
+    }
+    let mtime = md
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    Some((
+        rel.clone(),
+        FileHeader {
+            path: rel,
+            size: md.len(),
+            mtime,
+        },
+    ))
 }
 
 // ---- keys ---------------------------------------------------------------

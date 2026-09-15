@@ -730,3 +730,244 @@ fn typo_check_lists_only_the_selected_packages() {
     assert_eq!(bare.code, 1);
     assert!(bare.stderr().contains("Available: it, smoke"), "{}", bare.stderr());
 }
+
+/// A scratch copy of the probe fixture with two files held back by two
+/// different rules, so an `--include` test never writes into the fixture the
+/// rest of the suite is reading.
+///
+/// `git init` because .gitignore only applies inside a repository. `.ignore`
+/// answers to no git at all, which is why it is the second rule.
+fn ignoring_scratch(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("rbuild-inc-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    copy_tree(&fixture("probe"), &dir);
+
+    std::fs::write(dir.join(".gitignore"), "by-gitignore.txt\n").expect("write .gitignore");
+    std::fs::write(dir.join(".ignore"), "by-dot-ignore.txt\n").expect("write .ignore");
+    std::fs::write(dir.join("by-gitignore.txt"), b"not source")
+        .expect("write the git-ignored file");
+    std::fs::write(dir.join("by-dot-ignore.txt"), b"not source")
+        .expect("write the dot-ignored file");
+
+    let init = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&dir)
+        .output()
+        .expect("git init");
+    assert!(
+        init.status.success(),
+        "git init failed in {}",
+        dir.display()
+    );
+
+    dir
+}
+
+/// The name the server files a scratch tree under: the sync root's own dirname.
+fn project_of(dir: &Path) -> String {
+    dir.file_name()
+        .and_then(|s| s.to_str())
+        .expect("scratch name")
+        .to_string()
+}
+
+/// `--include` is the only way an ignored file reaches the server, whichever
+/// rule holds it back, and it says what *this run* syncs: the run that forgets
+/// it takes the file back off, the same way deleting it locally would.
+#[test]
+fn ignored_files_reach_the_server_only_when_included() {
+    let scratch = ignoring_scratch("only-when-included");
+    let project = project_of(&scratch);
+
+    let rig = Rig::start("include");
+    let by_git = rig.remote_project(&project).join("by-gitignore.txt");
+    let by_dot = rig.remote_project(&project).join("by-dot-ignore.txt");
+
+    let without = rig.client_in(&scratch, &["check"]);
+    let synced_without = (by_git.exists(), by_dot.exists());
+
+    let with = rig.client_in(
+        &scratch,
+        &[
+            "check",
+            "--include",
+            "by-gitignore.txt",
+            "--include",
+            "by-dot-ignore.txt",
+        ],
+    );
+    let synced_with = (by_git.exists(), by_dot.exists());
+
+    let forgotten = rig.client_in(&scratch, &["check"]);
+    let kept_after = (by_git.exists(), by_dot.exists());
+
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    assert_eq!(without.code, 0, "{}", without.stderr());
+    assert_eq!(with.code, 0, "{}", with.stderr());
+    assert_eq!(forgotten.code, 0, "{}", forgotten.stderr());
+
+    assert_eq!(
+        synced_without,
+        (false, false),
+        "the ignore rules should have held both back"
+    );
+    assert_eq!(
+        synced_with,
+        (true, true),
+        "--include did not send them:\n{}",
+        with.stderr()
+    );
+    assert_eq!(
+        kept_after,
+        (false, false),
+        "a run without the flag left them on the server"
+    );
+}
+
+/// The attached form, and proof the glob is rbuild's own: cargo has no
+/// `--include`, so a forwarded one would fail the build instead.
+#[test]
+fn include_takes_the_attached_form_and_never_reaches_cargo() {
+    let scratch = ignoring_scratch("attached");
+    let project = project_of(&scratch);
+
+    let rig = Rig::start("include-attached");
+    let r = rig.client_in(&scratch, &["check", "--include=**/by-*.txt"]);
+    let synced = rig
+        .remote_project(&project)
+        .join("by-gitignore.txt")
+        .exists();
+
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    assert_eq!(r.code, 0, "{}", r.stderr());
+    assert!(synced, "the glob matched nothing:\n{}", r.stderr());
+}
+
+/// `.git` and `target` stay behind whatever a glob names: the most permissive
+/// one there is would otherwise push the whole history and the build output at
+/// a builder other people share.
+#[test]
+fn git_and_target_stay_behind_under_a_permissive_glob() {
+    let scratch = ignoring_scratch("permissive");
+    let project = project_of(&scratch);
+    std::fs::create_dir_all(scratch.join("target")).expect("mkdir target");
+    std::fs::write(scratch.join("target").join("junk.bin"), b"build output").expect("write junk");
+
+    let rig = Rig::start("include-permissive");
+    let r = rig.client_in(&scratch, &["check", "--include=**"]);
+    let there = rig.remote_project(&project);
+    let reached_ignored = there.join("by-gitignore.txt").exists();
+    let sent_git = there.join(".git").exists();
+    let sent_target = there.join("target").exists();
+
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    assert_eq!(r.code, 0, "{}", r.stderr());
+    assert!(
+        reached_ignored,
+        "the glob reached nothing the ignore rules held back:\n{}",
+        r.stderr()
+    );
+    assert!(!sent_git, ".git went to the server");
+    assert!(!sent_target, "target went to the server");
+}
+
+/// A glob that names nothing looks exactly like one that worked, and the run
+/// that swallows it builds against a file that never arrived.
+#[test]
+fn a_glob_that_matches_nothing_says_so() {
+    let scratch = ignoring_scratch("no-match");
+
+    let rig = Rig::start("include-no-match");
+    let r = rig.client_in(&scratch, &["check", "--include", "by-gitignroe.txt"]);
+
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    assert_eq!(r.code, 0, "{}", r.stderr());
+    assert!(
+        r.stderr()
+            .contains("--include matched nothing: by-gitignroe.txt"),
+        "{}",
+        r.stderr()
+    );
+}
+
+/// A glob is required, and a malformed one is caught before anything connects.
+#[test]
+fn include_without_a_usable_glob_is_a_usage_error() {
+    let bare = offline(&["check", "--include"]);
+    assert_eq!(bare.code, 1);
+    assert!(
+        bare.stderr().contains("--include needs a glob"),
+        "{}",
+        bare.stderr()
+    );
+
+    let flag_shaped = offline(&["check", "--include", "--remote"]);
+    assert_eq!(flag_shaped.code, 1);
+    assert!(
+        flag_shaped.stderr().contains("--include needs a glob"),
+        "{}",
+        flag_shaped.stderr()
+    );
+
+    let malformed = offline(&["check", "--include=a[b"]);
+    assert_eq!(malformed.code, 1);
+    assert!(
+        malformed.stderr().contains("--include"),
+        "{}",
+        malformed.stderr()
+    );
+}
+
+/// The removal `--include` promises holds for every later run, `--full`
+/// included: a full re-upload is a repair, and a secret this run doesn't name
+/// still comes off.
+#[test]
+fn a_full_run_without_the_flag_still_takes_the_included_file_off() {
+    let scratch = ignoring_scratch("full");
+    let project = project_of(&scratch);
+
+    let rig = Rig::start("include-full");
+    let there = rig.remote_project(&project).join("by-gitignore.txt");
+
+    let with = rig.client_in(&scratch, &["check", "--include", "by-gitignore.txt"]);
+    let synced = there.exists();
+
+    let forgotten = rig.client_in(&scratch, &["check", "--full"]);
+    let kept = there.exists();
+
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    assert_eq!(with.code, 0, "{}", with.stderr());
+    assert_eq!(forgotten.code, 0, "{}", forgotten.stderr());
+
+    assert!(synced, "--include did not send it:\n{}", with.stderr());
+    assert!(!kept, "a --full run without the flag left it on the server");
+}
+
+/// Past `--` the words belong to the program, so a flag spelled like one of
+/// rbuild's own stays in its argv.
+#[test]
+fn rbuild_flags_after_the_dash_dash_belong_to_the_program() {
+    let rig = Rig::start("argv-flags");
+    let r = rig.client(&[
+        "run",
+        "--remote",
+        "--bin",
+        "alpha",
+        "--",
+        "0",
+        "--full",
+        "--include",
+    ]);
+
+    assert_eq!(r.code, 0, "{}", r.stderr());
+    assert!(
+        r.stdout().contains(r#"ARGV=["0", "--full", "--include"]"#),
+        "rbuild ate the program's own arguments:\n{}",
+        r.stdout()
+    );
+}

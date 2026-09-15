@@ -133,6 +133,7 @@ name = "cargo-rbuild"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "globset",
  "ignore",
  "rand_core",
  "rpassword",
