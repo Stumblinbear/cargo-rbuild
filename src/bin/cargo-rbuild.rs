@@ -43,7 +43,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, IsTerminal, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf, MAIN_SEPARATOR_STR};
 use std::process::{Command, ExitCode};
@@ -1057,6 +1057,7 @@ fn remote(
             args: cargo_args.to_vec(),
             target: target.map(String::from),
             trailing: trailing.to_vec(),
+            color: term_color(),
         },
     )?;
 
@@ -1521,6 +1522,19 @@ fn exec_local(exe: &Path, args: &[String]) -> ExitCode {
     match Command::new(exe).args(args).status() {
         Ok(s) => ExitCode::from(s.code().unwrap_or(1).min(255) as u8),
         Err(e) => die(&format!("exec: {e}")),
+    }
+}
+
+/// The `CARGO_TERM_COLOR` the server's cargo runs with. A value set here
+/// stands; `auto`, or none, is settled against this process's stderr, where
+/// cargo's diagnostics land, since the server's cargo writes into a pipe. A
+/// piped stderr sends `None`, and cargo, seeing its own pipe, reaches the same
+/// answer unless the project's `term.color` says otherwise.
+fn term_color() -> Option<String> {
+    match std::env::var("CARGO_TERM_COLOR") {
+        Ok(v) if v != "auto" => Some(v),
+        _ if io::stderr().is_terminal() => Some("always".into()),
+        _ => None,
     }
 }
 

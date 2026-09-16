@@ -205,6 +205,9 @@ fn serve(stream: TcpStream, authorized: &[PublicKey], host_key: &PrivateKey) -> 
                     &args,
                     target.as_deref(),
                     &trailing,
+                    // An older client sends no colour and reads the output as
+                    // a terminal would.
+                    Some("always"),
                     Streams::Merged,
                 )?;
                 let Some(code) = code else { continue };
@@ -217,6 +220,7 @@ fn serve(stream: TcpStream, authorized: &[PublicKey], host_key: &PrivateKey) -> 
                 args,
                 target,
                 trailing,
+                color,
             } => {
                 let code = cargo_for(
                     &mut w,
@@ -227,6 +231,7 @@ fn serve(stream: TcpStream, authorized: &[PublicKey], host_key: &PrivateKey) -> 
                     &args,
                     target.as_deref(),
                     &trailing,
+                    color.as_deref(),
                     Streams::Tagged,
                 )?;
                 let Some(code) = code else { continue };
@@ -302,6 +307,7 @@ fn cargo_for<W: Write>(
     args: &[String],
     target: Option<&str>,
     trailing: &[String],
+    color: Option<&str>,
     streams: Streams,
 ) -> io::Result<Option<i32>> {
     if !valid_project(project) {
@@ -320,6 +326,7 @@ fn cargo_for<W: Write>(
         args,
         target,
         trailing,
+        color,
         streams,
     )
     .map(Some)
@@ -348,6 +355,7 @@ fn run_cargo<W: Write>(
     args: &[String],
     target: Option<&str>,
     trailing: &[String],
+    color: Option<&str>,
     streams: Streams,
 ) -> io::Result<i32> {
     if !cwd.is_dir() {
@@ -382,10 +390,16 @@ fn run_cargo<W: Write>(
         cmd.arg("--").args(trailing);
     }
 
+    // Without a colour from the client, cargo settles its own, and one in this
+    // server's environment must not stand in for it.
+    match color {
+        Some(c) => cmd.env("CARGO_TERM_COLOR", c),
+        None => cmd.env_remove("CARGO_TERM_COLOR"),
+    };
+
     let mut child = cmd
         .current_dir(cwd)
         .env("CARGO_TARGET_DIR", target_dir)
-        .env("CARGO_TERM_COLOR", "always")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -166,6 +166,12 @@ impl Rig {
     /// Runs the client from an arbitrary directory — a workspace root or one
     /// of its members.
     fn client_in(&self, dir: &Path, args: &[&str]) -> Run {
+        run(self.command_in(dir, args))
+    }
+
+    /// The client command [`Rig::client_in`] runs, for a test that sets its
+    /// environment first.
+    fn command_in(&self, dir: &Path, args: &[&str]) -> Command {
         let mut cmd = Command::new(CLIENT);
         cmd.args(args)
             .current_dir(dir)
@@ -186,7 +192,7 @@ impl Rig {
         if std::env::var_os("CARGO_HOME").is_none() {
             cmd.env("CARGO_HOME", home.join(".cargo"));
         }
-        run(cmd)
+        cmd
     }
 }
 
@@ -386,6 +392,67 @@ fn test_fetches_every_test_binary_and_runs_them_here() {
     assert!(
         r.stderr().contains("doctests stay on the server"),
         "the doctest gap must be said out loud:\n{}",
+        r.stderr()
+    );
+}
+
+/// The server's cargo writes into a pipe, so the client decides the colour: a
+/// piped client reads plain text, and `CARGO_TERM_COLOR` still asks for colour.
+#[test]
+fn colour_follows_the_client() {
+    const ESC: char = '\x1b';
+    let rig = Rig::start("colour");
+
+    let mut piped = rig.command_in(&fixture("probe"), &["build", "--native"]);
+    piped.env_remove("CARGO_TERM_COLOR");
+    let r = run(piped);
+    assert_eq!(r.code, 0, "{}", r.stderr());
+    assert!(r.stderr().contains("Finished"), "{}", r.stderr());
+    assert!(
+        !r.stderr().contains(ESC),
+        "a piped client got colour:\n{}",
+        r.stderr()
+    );
+
+    let mut asked = rig.command_in(&fixture("probe"), &["build", "--native"]);
+    asked.env("CARGO_TERM_COLOR", "always");
+    let r = run(asked);
+    assert_eq!(r.code, 0, "{}", r.stderr());
+    assert!(
+        r.stderr().contains(ESC),
+        "CARGO_TERM_COLOR=always gave no colour:\n{}",
+        r.stderr()
+    );
+}
+
+/// A piped client with no `CARGO_TERM_COLOR` leaves colour to cargo, so the
+/// project's own `term.color` still asks for it.
+#[test]
+fn a_piped_client_keeps_the_configured_colour() {
+    const ESC: char = '\x1b';
+    let scratch = std::env::temp_dir().join(format!(
+        "rbuild-scratch-config-colour-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_tree(&fixture("probe"), &scratch);
+    std::fs::create_dir_all(scratch.join(".cargo")).expect("mkdir .cargo");
+    std::fs::write(
+        scratch.join(".cargo").join("config.toml"),
+        "[term]\ncolor = \"always\"\n",
+    )
+    .expect("write config");
+
+    let rig = Rig::start("config-colour");
+    let mut piped = rig.command_in(&scratch, &["build", "--native"]);
+    piped.env_remove("CARGO_TERM_COLOR");
+    let r = run(piped);
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    assert_eq!(r.code, 0, "{}", r.stderr());
+    assert!(
+        r.stderr().contains(ESC),
+        "term.color = \"always\" gave no colour:\n{}",
         r.stderr()
     );
 }

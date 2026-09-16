@@ -54,8 +54,6 @@ pub enum ClientMsg {
         rel: String,
     },
     Bye,
-    // Appended, not inserted: bincode numbers variants by position, so an older
-    // peer still decodes every message it already knew.
     /// Run cargo and reply with `Chunk`s, then `Exit`.
     ///
     /// Unlike [`ClientMsg::Build`], the two output streams stay apart, so the
@@ -70,6 +68,10 @@ pub enum ClientMsg {
         target: Option<String>,
         /// Args after `--`: the program's own argv, or its harness's.
         trailing: Vec<String>,
+        /// `CARGO_TERM_COLOR` for the server's cargo, resolved by the client,
+        /// since only the client can see whether its output is a terminal.
+        /// `None` leaves colour to cargo's own `auto` and `term.color`.
+        color: Option<String>,
     },
 }
 
