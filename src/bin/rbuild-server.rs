@@ -7,6 +7,7 @@
 //!   RBUILD_TARGETS          default /targets
 //!   RBUILD_BIND             default 0.0.0.0:7878
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -116,6 +117,10 @@ fn serve(stream: TcpStream, authorized: &[PublicKey], host_key: &PrivateKey) -> 
     let src_root = PathBuf::from(env_or("RBUILD_SRC", "/src"));
     let tgt_root = PathBuf::from(env_or("RBUILD_TARGETS", "/targets"));
 
+    // `target_libdir` by (project, target): each call spawns rustc, and one
+    // binary's libraries arrive as several requests on this connection.
+    let mut target_libdirs: HashMap<(String, String), Option<PathBuf>> = HashMap::new();
+
     // ---- request loop ---------------------------------------------------
     loop {
         let msg: ClientMsg = match recv(&mut r) {
@@ -182,9 +187,10 @@ fn serve(stream: TcpStream, authorized: &[PublicKey], host_key: &PrivateKey) -> 
                         received += want as u64;
                     }
                     f.flush()?;
-                    drop(f);
-                    // Cargo fingerprints on mtime, so it has to survive the wire.
-                    set_mtime(&dst, h.mtime)?;
+                    // Cargo fingerprints sources by mtime, so the client's has to
+                    // survive the wire. It is set after the flush, whose write
+                    // would move it.
+                    f.get_ref().set_modified(mtime_to_system_time(h.mtime))?;
                 }
                 send(&mut w, &ServerMsg::PushOk { received })?;
             }
@@ -249,24 +255,100 @@ fn serve(stream: TcpStream, authorized: &[PublicKey], host_key: &PrivateKey) -> 
                         &mut w,
                         &ServerMsg::Error(format!("{}: {e}", path.display())),
                     )?,
-                    Ok(f) => {
-                        let raw = f.metadata().map(|m| m.len()).unwrap_or(0);
-                        let mut f = BufReader::with_capacity(CHUNK, f);
-
-                        // zstd's encoder emits ~128 KB blocks; each becomes one Data frame.
-                        let mut enc = zstd::stream::write::Encoder::new(
-                            FrameSink { w: &mut w },
-                            zstd_level(),
-                        )?;
-                        io::copy(&mut f, &mut enc)?;
-                        enc.finish()?; // flushes the trailing block; returns the sink, which we drop
-
-                        send(&mut w, &ServerMsg::DataEnd { raw })?;
-                    }
+                    Ok(f) => send_body(&mut w, f)?,
                 }
+            }
+
+            ClientMsg::FetchLibrary {
+                project,
+                target,
+                dirs,
+                name,
+                have,
+            } => {
+                // `valid_rel` allows a `/`, which in a name would search below
+                // the dirs asked for.
+                if !valid_project(&project)
+                    || !valid_rel(&name)
+                    || name.contains('/')
+                    || !dirs.iter().all(|d| valid_rel(d))
+                {
+                    send(&mut w, &ServerMsg::Error("bad path".into()))?;
+                    continue;
+                }
+                let tdir = tgt_root.join(&project);
+                let found = dirs
+                    .iter()
+                    .map(|d| tdir.join(d).join(&name))
+                    .find(|p| p.is_file())
+                    .or_else(|| {
+                        target_libdirs
+                            .entry((project.clone(), target.clone()))
+                            .or_insert_with(|| target_libdir(&src_root.join(&project), &target))
+                            .as_ref()
+                            .map(|d| d.join(&name))
+                            .filter(|p| p.is_file())
+                    });
+                let Some(path) = found else {
+                    send(&mut w, &ServerMsg::LibraryMissing)?;
+                    continue;
+                };
+
+                let f = match fs::File::open(&path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        send(
+                            &mut w,
+                            &ServerMsg::Error(format!("{}: {e}", path.display())),
+                        )?;
+                        continue;
+                    }
+                };
+                let stamp = FileStamp::of(&f.metadata()?);
+                if have.is_some_and(|h| h.is_same(&stamp)) {
+                    send(&mut w, &ServerMsg::LibraryUnchanged)?;
+                    continue;
+                }
+                send(&mut w, &ServerMsg::Library { mtime: stamp.mtime })?;
+                send_body(&mut w, f)?;
             }
         }
     }
+}
+
+/// Sends `f` as a reply's body: zstd-compressed `Data` frames, then a
+/// `DataEnd` with its uncompressed length.
+fn send_body<W: Write>(w: &mut W, f: fs::File) -> io::Result<()> {
+    let raw = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut f = BufReader::with_capacity(CHUNK, f);
+
+    // zstd's encoder emits ~128 KB blocks; each becomes one Data frame.
+    let mut enc = zstd::stream::write::Encoder::new(FrameSink { w: &mut *w }, zstd_level())?;
+    io::copy(&mut f, &mut enc)?;
+    enc.finish()?;
+
+    send(w, &ServerMsg::DataEnd { raw })
+}
+
+/// The library dir for `target` of the toolchain the project in `project`
+/// builds with, or `None` when rustc cannot report one.
+///
+/// It holds Rust's own dylibs, `std-<hash>.dll` among them.
+fn target_libdir(project: &Path, target: &str) -> Option<PathBuf> {
+    let out = Command::new("rustc")
+        .args(["--print", "target-libdir", "--target", target])
+        // A `rust-toolchain.toml` in the project's tree picks the toolchain
+        // its build used.
+        .current_dir(project)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let dir = String::from_utf8(out.stdout).ok()?;
+    Some(PathBuf::from(dir.trim_end()))
 }
 
 pub fn zstd_level() -> i32 {
@@ -485,54 +567,12 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<FileHeader>) {
                 .filter_map(|c| c.as_os_str().to_str())
                 .collect::<Vec<_>>()
                 .join("/");
-            let mtime = md
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
+            let FileStamp { size, mtime } = FileStamp::of(&md);
             out.push(FileHeader {
                 path: rel,
-                size: md.len(),
+                size,
                 mtime,
             });
         }
     }
-}
-
-#[cfg(unix)]
-fn set_mtime(path: &Path, secs: i64) -> io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes())?;
-    let times = [
-        libc_timeval {
-            tv_sec: secs,
-            tv_usec: 0,
-        },
-        libc_timeval {
-            tv_sec: secs,
-            tv_usec: 0,
-        },
-    ];
-    // utimes(2) — avoids pulling in the whole libc crate for one call
-    extern "C" {
-        fn utimes(path: *const std::ffi::c_char, times: *const libc_timeval) -> i32;
-    }
-    let rc = unsafe { utimes(c.as_ptr(), times.as_ptr()) };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-#[repr(C)]
-struct libc_timeval {
-    tv_sec: i64,
-    tv_usec: i64,
-}
-
-#[cfg(not(unix))]
-fn set_mtime(_path: &Path, _secs: i64) -> io::Result<()> {
-    Ok(())
 }

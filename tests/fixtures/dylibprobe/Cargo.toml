@@ -1,0 +1,14 @@
+# Standalone on purpose: without an empty [workspace], cargo walks up, finds the
+# rbuild manifest, and refuses to build the crate.
+[workspace]
+
+[package]
+name = "dylibprobe"
+version = "0.1.0"
+edition = "2021"
+
+# A Rust dylib, so the bin imports `dycore.dll` from the build, the way a game
+# linking `bevy_dylib` does. `.cargo/config.toml` makes it import std as well.
+[lib]
+name = "dycore"
+crate-type = ["dylib"]

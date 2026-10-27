@@ -2,7 +2,8 @@
 //!
 //! The server builds; this machine runs what it built. Whatever cargo would have
 //! executed, rbuild fetches and executes here, and cargo's own JSON says which
-//! file that is, hash and all.
+//! file that is, hash and all. Each DLL it imports that the build or its
+//! toolchain holds, a Rust dylib or `std-<hash>.dll`, is fetched beside it.
 //!
 //!   rbuild                     cargo build
 //!   rbuild run                 build, then execute locally
@@ -41,7 +42,10 @@
 //!   RBUILD_PORT   default 7878
 //!   RBUILD_KEY    default ~/.ssh/id_ed25519
 
-use std::collections::HashMap;
+mod ntstatus;
+mod pe_imports;
+
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufReader, BufWriter, IsTerminal, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -995,13 +999,11 @@ fn remote(
         _ => return Err(io::Error::other("expected Manifest")),
     };
 
-    // rsync's quick check: size or mtime differs -> resend. 1s tolerance,
-    // because NTFS and ext4 disagree about granularity.
     let mut upload: Vec<FileHeader> = local_files
         .values()
         .filter(|h| {
             full || match remote_files.get(&h.path) {
-                Some(rh) => rh.size != h.size || (rh.mtime - h.mtime).abs() > 1,
+                Some(rh) => !rh.stamp().is_same(&h.stamp()),
                 None => true,
             }
         })
@@ -1111,6 +1113,7 @@ fn remote(
 
     // ---- fetch ----------------------------------------------------------
     let t = target.expect("a fetch implies a cross target");
+    let linked = records.linked_dirs(t);
     let mut exes = Vec::new();
     for exe in records.executables(here) {
         // The path cargo reports is absolute on the server, and the server will
@@ -1127,6 +1130,17 @@ fn remote(
                 .replace('/', MAIN_SEPARATOR_STR),
         );
         fetch(&mut r, &mut w, sync_root, proj, &rel, &dst)?;
+
+        // Not returned as an `Err`, which `main` meets with a local build of the
+        // whole project, and that mends nothing the server built.
+        if let Err(e) = fetch_libraries(&mut r, &mut w, sync_root, proj, t, &rel, &dst, &linked) {
+            eprintln!("[rbuild] error: {e}");
+            let _ = send(&mut w, &ClientMsg::Bye);
+            return Ok(Built {
+                code: 1,
+                exes: Vec::new(),
+            });
+        }
         exes.push(dst);
     }
 
@@ -1158,8 +1172,163 @@ fn fetch<R: Read, W: Write>(
             project: proj.into(),
             rel: rel.into(),
         },
-    )?;
+    )
+    .and_then(|()| receive_body(r, cwd, dst, None))
+    .map_err(|e| fetch_error(rel, e))
+}
 
+/// The error to report for `e`, which a fetch of `file` failed with.
+///
+/// A read or write that failed because the server closed the connection
+/// reports the close.
+fn fetch_error(file: &str, e: io::Error) -> io::Error {
+    let what = match e.kind() {
+        io::ErrorKind::UnexpectedEof
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted => "the server closed the connection".to_string(),
+        _ => e.to_string(),
+    };
+    io::Error::new(e.kind(), format!("failed to fetch {file}: {what}"))
+}
+
+/// The outcome of one [`ClientMsg::FetchLibrary`].
+enum LibraryFetch {
+    /// The server holds no copy.
+    Missing,
+    /// The copy at the destination matches the server's.
+    Unchanged,
+    Fetched,
+}
+
+/// Fetches beside `exe` every DLL it imports that the server's build or
+/// toolchain holds, and every DLL those import in turn.
+///
+/// Windows' loader looks beside the exe first, so the binary starts the same
+/// under rbuild and on its own. `rel` is the exe's path under the target tree,
+/// and `linked` the dirs cargo's build scripts reported there. A DLL the
+/// server lacks is named on stderr and left to Windows.
+///
+/// A DLL in the Windows system dir, or an API set, is never asked for, so a
+/// binary importing only those sends no request and still works against a
+/// server older than [`ClientMsg::FetchLibrary`].
+#[allow(clippy::too_many_arguments)]
+fn fetch_libraries<R: Read, W: Write>(
+    r: &mut R,
+    w: &mut W,
+    cwd: &Path,
+    proj: &str,
+    target: &str,
+    rel: &str,
+    exe: &Path,
+    linked: &[String],
+) -> io::Result<()> {
+    let dirs = library_dirs(rel, linked);
+    let beside = exe.parent().unwrap_or(cwd);
+    let system = std::env::var_os("SystemRoot").map(|root| PathBuf::from(root).join("System32"));
+
+    // Windows matches DLL names without regard to case.
+    let mut seen = HashSet::new();
+    let mut pending = pe_imports::imported_dlls(exe)?;
+    while let Some(name) = pending.pop() {
+        if !seen.insert(name.to_ascii_lowercase()) || is_system_library(&name, system.as_deref()) {
+            continue;
+        }
+        // The server refuses a name that is more than one file name; see
+        // `ClientMsg::FetchLibrary`.
+        if !valid_rel(&name) || name.contains('/') {
+            continue;
+        }
+
+        let dst = beside.join(&name);
+        match fetch_library(r, w, cwd, proj, target, &dirs, &name, &dst)? {
+            LibraryFetch::Missing => {
+                eprintln!(
+                    "[rbuild] {name} is in neither the build nor its toolchain, left to Windows"
+                );
+            }
+            LibraryFetch::Unchanged | LibraryFetch::Fetched => {
+                pending.extend(pe_imports::imported_dlls(&dst)?);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether Windows supplies the DLL `name`: an API set, which names a contract
+/// rather than a file, or a file in `system`.
+fn is_system_library(name: &str, system: Option<&Path>) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("api-ms-")
+        || lower.starts_with("ext-ms-")
+        || system.is_some_and(|dir| dir.join(name).is_file())
+}
+
+/// The dirs under the target tree that `cargo run` puts on a program's library
+/// search path, in its order, behind the exe's own dir, where the loader looks
+/// first.
+///
+/// The toolchain's library dir, last in `cargo run`'s order, is the server's
+/// to search. `rel` and `linked` are those [`fetch_libraries`] takes.
+fn library_dirs(rel: &str, linked: &[String]) -> Vec<String> {
+    let exe_dir = rel.rsplit_once('/').map_or("", |(dir, _)| dir);
+    // `<triple>/<profile>`, the start of every path cargo reports.
+    let profile = rel.splitn(3, '/').take(2).collect::<Vec<_>>().join("/");
+    let inside = format!("{profile}/");
+
+    let mut dirs = vec![exe_dir.to_string()];
+    dirs.extend(linked.iter().filter(|d| d.starts_with(&inside)).cloned());
+    dirs.push(format!("{profile}/deps"));
+    dirs.push(profile);
+
+    let mut seen = HashSet::new();
+    dirs.retain(|d| seen.insert(d.clone()));
+    dirs
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fetch_library<R: Read, W: Write>(
+    r: &mut R,
+    w: &mut W,
+    cwd: &Path,
+    proj: &str,
+    target: &str,
+    dirs: &[String],
+    name: &str,
+    dst: &Path,
+) -> io::Result<LibraryFetch> {
+    let mut request_library = || {
+        send(
+            w,
+            &ClientMsg::FetchLibrary {
+                project: proj.into(),
+                target: target.into(),
+                dirs: dirs.to_vec(),
+                name: name.into(),
+                have: fs::metadata(dst).ok().map(|md| FileStamp::of(&md)),
+            },
+        )?;
+
+        match recv::<ServerMsg, _>(r)? {
+            ServerMsg::LibraryMissing => Ok(LibraryFetch::Missing),
+            ServerMsg::LibraryUnchanged => Ok(LibraryFetch::Unchanged),
+            ServerMsg::Library { mtime } => {
+                receive_body(r, cwd, dst, Some(mtime))?;
+                Ok(LibraryFetch::Fetched)
+            }
+            ServerMsg::Error(e) => Err(io::Error::other(e)),
+            other => Err(io::Error::other(format!(
+                "unexpected {} reply",
+                other.variant_name()
+            ))),
+        }
+    };
+
+    request_library().map_err(|e| fetch_error(name, e))
+}
+
+/// Receives a reply's body into `dst`, which is replaced only once the whole
+/// body has arrived, and stamps it with `mtime` when given one.
+fn receive_body<R: Read>(r: &mut R, cwd: &Path, dst: &Path, mtime: Option<i64>) -> io::Result<()> {
     let dir = dst.parent().unwrap_or(cwd);
     fs::create_dir_all(dir)?;
     let tmp = dst.with_extension("part");
@@ -1177,13 +1346,23 @@ fn fetch<R: Read, W: Write>(
                 ServerMsg::DataEnd { raw } => break raw,
                 ServerMsg::Error(e) => {
                     let _ = fs::remove_file(&tmp);
-                    return Err(io::Error::other(format!("fetch: {e}")));
+                    return Err(io::Error::other(e));
                 }
-                _ => return Err(io::Error::other("unexpected message during fetch")),
+                other => {
+                    return Err(io::Error::other(format!(
+                        "unexpected {} reply",
+                        other.variant_name()
+                    )))
+                }
             }
         };
         dec.flush()?;
-        dec.into_inner().flush()?;
+        let mut file = dec.into_inner();
+        file.flush()?;
+        // After the flush, for the reason on the `Push` arm in rbuild-server.rs.
+        if let Some(mtime) = mtime {
+            file.get_ref().set_modified(mtime_to_system_time(mtime))?;
+        }
         raw
     };
 
@@ -1210,6 +1389,9 @@ struct Json {
     /// the end of a line.
     partial: Vec<u8>,
     made: Vec<Made>,
+    /// Every build script's [`Record::linked_paths`], in the order cargo
+    /// reported them.
+    linked_paths: Vec<String>,
 }
 
 /// One executable cargo reported, and whether it is a harness.
@@ -1227,6 +1409,11 @@ struct Record {
     target: Option<RecordTarget>,
     profile: Option<RecordProfile>,
     executable: Option<String>,
+    /// On a `build-script-executed` record, the script's `rustc-link-search`
+    /// dirs, as cargo spells them: absolute on the server, each with its
+    /// `KIND=` if it was given one.
+    #[serde(default)]
+    linked_paths: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -1252,6 +1439,10 @@ impl Json {
         let Ok(rec) = serde_json::from_slice::<Record>(line) else {
             return;
         };
+        if rec.reason == "build-script-executed" {
+            self.linked_paths.extend(rec.linked_paths);
+            return;
+        }
         if rec.reason != "compiler-artifact" {
             return;
         }
@@ -1283,6 +1474,22 @@ impl Json {
                 Local::Every => m.harness,
             })
             .map(|m| m.path.clone())
+            .collect()
+    }
+
+    /// The build scripts' library search dirs inside the target tree, each as
+    /// [`rel_under_target`] spells it for `target`, with its `KIND=` dropped.
+    ///
+    /// A dir outside the tree is left out, since the server serves nothing
+    /// from it.
+    fn linked_dirs(&self, target: &str) -> Vec<String> {
+        self.linked_paths
+            .iter()
+            .map(|p| match p.split_once('=') {
+                Some(("native" | "crate" | "dependency" | "framework" | "all", dir)) => dir,
+                _ => p.as_str(),
+            })
+            .filter_map(|dir| rel_under_target(dir, target))
             .collect()
     }
 }
@@ -1520,7 +1727,14 @@ fn exec_local(exe: &Path, args: &[String]) -> ExitCode {
     eprintln!("[rbuild] running {}", exe.display());
     // cwd stays the crate root, matching `cargo run` — don't "fix" this
     match Command::new(exe).args(args).status() {
-        Ok(s) => ExitCode::from(s.code().unwrap_or(1).min(255) as u8),
+        Ok(s) => match s.code() {
+            Some(code) => match ntstatus::describe_failure(code) {
+                Some(what) => die(&format!("{} {what}", exe.display())),
+                None if code < 0 => ExitCode::FAILURE,
+                None => ExitCode::from(code.min(255) as u8),
+            },
+            None => ExitCode::FAILURE,
+        },
         Err(e) => die(&format!("exec: {e}")),
     }
 }

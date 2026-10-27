@@ -396,6 +396,99 @@ fn test_fetches_every_test_binary_and_runs_them_here() {
     );
 }
 
+/// A binary linked to a Rust dylib starts under rbuild and on its own, with the
+/// dylib and `std-<hash>.dll` fetched beside it, though cargo's JSON names
+/// neither.
+#[test]
+fn a_dynamically_linked_binary_brings_its_libraries() {
+    // A library left beside the exe by an earlier run comes back unchanged and
+    // is never fetched, so the binary would start with the fetch broken.
+    let fetched = fixture("dylibprobe").join("target").join("remote");
+    let _ = std::fs::remove_dir_all(&fetched);
+
+    let rig = Rig::start("dylib");
+    let path = path_without_rust_std();
+
+    let mut cmd = rig.command_in(&fixture("dylibprobe"), &["run"]);
+    cmd.env("PATH", &path);
+    let r = run(cmd);
+
+    assert_eq!(r.code, 0, "{}", r.stderr());
+    assert!(r.stdout().contains("DYLIB loaded"), "{}", r.stdout());
+
+    let names = fetched_file_names(&r);
+    assert!(
+        names.iter().any(|n| n == "dycore.dll"),
+        "the build's dylib was not fetched:\n{}",
+        r.stderr()
+    );
+    assert!(
+        names
+            .iter()
+            .any(|n| n.starts_with("std-") && n.ends_with(".dll")),
+        "the toolchain's std was not fetched:\n{}",
+        r.stderr()
+    );
+
+    // A second run finds both libraries current beside the exe and fetches
+    // neither.
+    let mut cmd = rig.command_in(&fixture("dylibprobe"), &["run"]);
+    cmd.env("PATH", &path);
+    let again = run(cmd);
+
+    assert_eq!(again.code, 0, "{}", again.stderr());
+    let refetched: Vec<String> = fetched_file_names(&again)
+        .into_iter()
+        .filter(|n| n.ends_with(".dll"))
+        .collect();
+    assert!(
+        refetched.is_empty(),
+        "unchanged libraries were fetched again: {refetched:?}\n{}",
+        again.stderr()
+    );
+
+    let exe = fetched.join("debug").join("dylibprobe.exe");
+    let alone = Command::new(&exe)
+        .env("PATH", &path)
+        .output()
+        .expect("run the fetched binary");
+    assert!(
+        alone.status.success(),
+        "the fetched binary did not start on its own: {:?}",
+        alone.status
+    );
+}
+
+/// The file names the client's stderr reports as fetched, one per `-> <path>`
+/// line it writes for a file received.
+fn fetched_file_names(r: &Run) -> Vec<String> {
+    r.err
+        .iter()
+        .filter_map(|l| l.text.rsplit_once(" -> "))
+        .filter_map(|(_, path)| Path::new(path).file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// `PATH` without the directories holding a `std-<hash>.dll`. `cargo test` puts
+/// the toolchain's on it, and a binary run under that `PATH` would load std
+/// whether or not rbuild fetched it.
+fn path_without_rust_std() -> std::ffi::OsString {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let kept: Vec<PathBuf> = std::env::split_paths(&path)
+        .filter(|dir| {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return true;
+            };
+            !entries.flatten().any(|e| {
+                let name = e.file_name().to_string_lossy().to_ascii_lowercase();
+                name.starts_with("std-") && name.ends_with(".dll")
+            })
+        })
+        .collect();
+    std::env::join_paths(kept).expect("join PATH")
+}
+
 /// The server's cargo writes into a pipe, so the client decides the colour: a
 /// piped client reads plain text, and `CARGO_TERM_COLOR` still asks for colour.
 #[test]

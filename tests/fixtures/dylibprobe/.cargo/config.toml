@@ -1,0 +1,4 @@
+# A bin beside a Rust dylib links std dynamically only when asked. A game's
+# dev build asks, and so imports `std-<hash>.dll` from the toolchain.
+[build]
+rustflags = ["-C", "prefer-dynamic"]
